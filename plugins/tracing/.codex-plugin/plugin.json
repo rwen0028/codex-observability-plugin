@@ -1,0 +1,29 @@
+{
+  "name": "tracing",
+  "version": "0.1.0",
+  "description": "Trace OpenAI Codex sessions to Langfuse.",
+  "author": {
+    "name": "Langfuse",
+    "email": "support@langfuse.com",
+    "url": "https://langfuse.com"
+  },
+  "homepage": "https://github.com/langfuse/codex-observability-plugin#readme",
+  "repository": "https://github.com/langfuse/codex-observability-plugin",
+  "license": "MIT",
+  "keywords": ["codex", "hooks", "langfuse", "observability", "tracing"],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Tracing",
+    "shortDescription": "Trace Codex sessions to Langfuse",
+    "longDescription": "Uploads completed OpenAI Codex rollout transcripts to Langfuse so teams can inspect Codex sessions as traces: agent turns, model calls, tool executions, token usage, and subagent threads.",
+    "developerName": "Langfuse",
+    "category": "Coding",
+    "capabilities": ["Read"],
+    "websiteURL": "https://langfuse.com",
+    "privacyPolicyURL": "https://langfuse.com/privacy",
+    "termsOfServiceURL": "https://langfuse.com/terms",
+    "defaultPrompt": [],
+    "brandColor": "#0A60B5",
+    "screenshots": []
+  }
+}
