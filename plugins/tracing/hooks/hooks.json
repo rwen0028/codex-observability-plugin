@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./plugins/tracing/dist/index.mjs",
+            "timeout": 30,
+            "statusMessage": "Uploading Codex trace to Langfuse"
+          }
+        ]
+      }
+    ]
+  }
+}

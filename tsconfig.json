@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true
+  },
+  "include": ["plugins/tracing/src", "plugins/tracing/test"],
+  "exclude": ["node_modules", "**/dist"]
+}

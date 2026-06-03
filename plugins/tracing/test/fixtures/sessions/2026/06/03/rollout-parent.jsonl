@@ -1,0 +1,11 @@
+{"timestamp":"2026-06-03T11:00:00.000Z","type":"session_meta","payload":{"id":"sess-parent","cli_version":"0.123.0","model_provider":"openai"}}
+{"timestamp":"2026-06-03T11:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-parent"}}
+{"timestamp":"2026-06-03T11:00:01.200Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"timestamp":"2026-06-03T11:00:01.300Z","type":"event_msg","payload":{"type":"user_message","message":"Spawn a subagent to tell a joke"}}
+{"timestamp":"2026-06-03T11:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"spawn_agent","call_id":"call-spawn","arguments":"{\"prompt\":\"tell a joke\"}"}}
+{"timestamp":"2026-06-03T11:00:02.300Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-fail","arguments":"{\"command\":[\"false\"]}"}}
+{"timestamp":"2026-06-03T11:00:02.500Z","type":"event_msg","payload":{"type":"collab_agent_spawn_end","call_id":"call-spawn","new_thread_id":"thread-child","status":"pending_init"}}
+{"timestamp":"2026-06-03T11:00:02.700Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-fail","status":"failed","exit_code":1,"stdout":"","stderr":"command failed","aggregated_output":"command failed"}}
+{"timestamp":"2026-06-03T11:00:02.800Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-fail","output":"command failed"}}
+{"timestamp":"2026-06-03T11:00:02.900Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":80,"output_tokens":10,"total_tokens":90,"cached_input_tokens":0,"reasoning_output_tokens":0},"total_token_usage":{"input_tokens":80,"output_tokens":10,"total_tokens":90,"cached_input_tokens":0,"reasoning_output_tokens":0}}}}
+{"timestamp":"2026-06-03T11:00:05.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-parent","reason":"interrupted"}}
