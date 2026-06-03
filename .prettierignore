@@ -1,4 +1,5 @@
 node_modules
+.claude
 plugins/tracing/dist
 pnpm-lock.yaml
 plugins/tracing/test/fixtures

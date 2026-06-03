@@ -95,6 +95,7 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | `LANGFUSE_CODEX_METADATA`                                     | No       | —                            | JSON object of metadata to attach to all traces          |
 | `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                      | Truncate inputs/outputs longer than this many characters |
 | `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                      | Set to `"true"` for verbose logging to stderr            |
+| `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                      | Set to `"true"` to make hook upload errors fail the hook |
 
 ### Data regions
 
@@ -107,24 +108,29 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 
 ## JSON config reference
 
-| Config key    | Environment variable                                          | Default                      | Description                       |
-| ------------- | ------------------------------------------------------------- | ---------------------------- | --------------------------------- |
-| `enabled`     | `TRACE_TO_LANGFUSE`                                           | `false`                      | Enable tracing                    |
-| `public_key`  | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                            | Langfuse public key               |
-| `secret_key`  | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                            | Langfuse secret key               |
-| `base_url`    | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com` | Langfuse host                     |
-| `environment` | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                            | Environment label                 |
-| `user_id`     | `LANGFUSE_CODEX_USER_ID`                                      | —                            | User id for all traces            |
-| `tags`        | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
-| `metadata`    | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
-| `max_chars`   | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
-| `debug`       | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
+| Config key      | Environment variable                                          | Default                      | Description                       |
+| --------------- | ------------------------------------------------------------- | ---------------------------- | --------------------------------- |
+| `enabled`       | `TRACE_TO_LANGFUSE`                                           | `false`                      | Enable tracing                    |
+| `public_key`    | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                            | Langfuse public key               |
+| `secret_key`    | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                            | Langfuse secret key               |
+| `base_url`      | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com` | Langfuse host                     |
+| `environment`   | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                            | Environment label                 |
+| `user_id`       | `LANGFUSE_CODEX_USER_ID`                                      | —                            | User id for all traces            |
+| `tags`          | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
+| `metadata`      | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
+| `max_chars`     | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
+| `debug`         | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
+| `fail_on_error` | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                      | Fail the hook on upload errors    |
 
 ## Troubleshooting
 
 - **No traces appear** — confirm `plugin_hooks = true`, the plugin is enabled in `config.toml`, and `TRACE_TO_LANGFUSE=true` is visible to the Codex process. Run with `LANGFUSE_CODEX_DEBUG=true` to log to stderr.
 - **Authentication fails** — check that the public/secret keys are valid and that `LANGFUSE_BASE_URL` matches the region the keys belong to.
 - **Traces land in the wrong project** — API keys are project-scoped in Langfuse; use the keys for the project you want.
+- **Testing hook failures** — set `LANGFUSE_CODEX_FAIL_ON_ERROR=true` together with `LANGFUSE_CODEX_DEBUG=true` to make Codex report upload or flush errors instead of failing open.
+- **Checking dedup sidecars** — successful uploads of completed turns are recorded next to the rollout as `<rollout>.jsonl.langfuse`. If a Stop hook reads the rollout before Codex has written the turn-completed marker, the trace may upload without a sidecar entry; the next Stop hook will finalize and mark it.
+- **Verifying in Langfuse** — use `npx langfuse-cli api traces list --from-timestamp <recent ISO> --limit 10 --order-by timestamp.desc --fields core,metrics,observations --json` with credentials for the same project.
+- **Sandboxed/network-restricted runs** — Codex sandbox or network policy can prevent exports from reaching Langfuse. Debug logging and fail-on-error mode are the quickest way to distinguish hook execution from network failure.
 - **Self-hosting** — the TypeScript SDK requires Langfuse platform version >= 3.95.0.
 
 ## Data sent to Langfuse

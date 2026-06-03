@@ -33,6 +33,7 @@ describe("getConfig", () => {
     expect(config.enabled).toBe(false);
     expect(config.base_url).toBe("https://cloud.langfuse.com");
     expect(config.max_chars).toBe(20_000);
+    expect(config.fail_on_error).toBe(false);
   });
 
   it("reads credentials and enable flag from environment variables", async () => {
@@ -117,5 +118,22 @@ describe("getConfig", () => {
 
     const config = await getConfig({ home, cwd: emptyHome(), env: {} });
     expect(config.enabled).toBe(false);
+  });
+
+  it("parses fail-on-error from config and environment", async () => {
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { fail_on_error: "true" },
+    });
+
+    const fromFile = await getConfig({ home, cwd: emptyHome(), env: {} });
+    expect(fromFile.fail_on_error).toBe(true);
+
+    const fromEnv = await getConfig({
+      home,
+      cwd: emptyHome(),
+      env: { LANGFUSE_CODEX_FAIL_ON_ERROR: "false" },
+    });
+    expect(fromEnv.fail_on_error).toBe(false);
   });
 });

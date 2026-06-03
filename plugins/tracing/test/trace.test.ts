@@ -24,6 +24,7 @@ const baseConfig: Config = {
   base_url: "https://cloud.langfuse.com",
   max_chars: 20_000,
   debug: false,
+  fail_on_error: false,
 };
 
 const fixturesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/sessions");

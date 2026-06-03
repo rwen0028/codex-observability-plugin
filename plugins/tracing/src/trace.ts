@@ -275,6 +275,10 @@ export async function convertRollout(
     if (turn.completed && turn.turnId) {
       uploaded.add(turn.turnId);
       await markTurnUploaded(rolloutFile, turn.turnId);
+    } else if (turn.turnId) {
+      debugLog(
+        `uploaded in-progress turn ${turn.turnId}; waiting for completion before sidecar mark`,
+      );
     }
   }
 }

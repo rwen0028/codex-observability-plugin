@@ -4275,14 +4275,16 @@ const ConfigSchema = object({
 	tags: array(string()).optional(),
 	metadata: record(string(), string()).optional(),
 	max_chars: number().int().positive(),
-	debug: boolean()
+	debug: boolean(),
+	fail_on_error: boolean()
 });
 const PartialConfigSchema = ConfigSchema.partial();
 const DEFAULTS = {
 	enabled: false,
 	base_url: "https://cloud.langfuse.com",
 	max_chars: 2e4,
-	debug: false
+	debug: false,
+	fail_on_error: false
 };
 function parseBoolean(value) {
 	if (typeof value === "boolean") return value;
@@ -4344,7 +4346,8 @@ async function readConfigFile(file) {
 			tags: raw.tags != null ? parseTags(raw.tags) : void 0,
 			metadata: raw.metadata != null ? parseMetadata(raw.metadata) : void 0,
 			max_chars: raw.max_chars != null ? parseInteger(raw.max_chars) : void 0,
-			debug: raw.debug != null ? parseBoolean(raw.debug) : void 0
+			debug: raw.debug != null ? parseBoolean(raw.debug) : void 0,
+			fail_on_error: raw.fail_on_error != null ? parseBoolean(raw.fail_on_error) : void 0
 		}));
 	} catch {
 		return;
@@ -4364,7 +4367,8 @@ function readEnvConfig(env) {
 		tags: parseTags(env.LANGFUSE_CODEX_TAGS),
 		metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
 		max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
-		debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG)
+		debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG),
+		fail_on_error: parseBoolean(env.LANGFUSE_CODEX_FAIL_ON_ERROR)
 	}));
 }
 const getHomeDir = () => process.env.HOME ?? os$2.homedir();
@@ -46983,12 +46987,13 @@ async function convertRollout(rolloutFile, options) {
 		if (turn.completed && turn.turnId) {
 			uploaded.add(turn.turnId);
 			await markTurnUploaded(rolloutFile, turn.turnId);
-		}
+		} else if (turn.turnId) debugLog(`uploaded in-progress turn ${turn.turnId}; waiting for completion before sidecar mark`);
 	}
 }
 
 //#endregion
 //#region src/index.ts
+let failOnError = process.env.LANGFUSE_CODEX_FAIL_ON_ERROR === "true";
 /**
 * Entry point for the Codex `Stop` hook.
 *
@@ -46997,7 +47002,9 @@ async function convertRollout(rolloutFile, options) {
 * transcript into Langfuse traces.
 *
 * The hook fails open: any error is logged (in debug mode) and swallowed so a
-* tracing problem never blocks the Codex session.
+* tracing problem never blocks the Codex session. Set
+* `LANGFUSE_CODEX_FAIL_ON_ERROR=true` while testing if you want Codex to report
+* hook failures instead.
 */
 async function runHook() {
 	let hookInput;
@@ -47008,6 +47015,7 @@ async function runHook() {
 	}
 	const config$1 = await getConfig();
 	setDebug(config$1.debug);
+	failOnError = config$1.fail_on_error;
 	if (!config$1.enabled) {
 		debugLog("tracing disabled (set TRACE_TO_LANGFUSE=true to enable)");
 		return;
@@ -47025,16 +47033,19 @@ async function runHook() {
 		await convertRollout(hookInput.transcript_path, { config: config$1 });
 	} catch (error) {
 		debugLog("failed to convert rollout:", error);
+		if (config$1.fail_on_error) throw error;
 	} finally {
 		try {
 			await instrumentation.shutdown();
 		} catch (error) {
 			debugLog("error during flush/shutdown:", error);
+			if (config$1.fail_on_error) throw error;
 		}
 	}
 }
 runHook().catch((error) => {
 	if (process.env.LANGFUSE_CODEX_DEBUG === "true") console.error("[langfuse-codex] fatal:", error);
+	if (failOnError) process.exitCode = 1;
 });
 
 //#endregion
