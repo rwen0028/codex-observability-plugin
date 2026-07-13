@@ -31,6 +31,8 @@ export const ConfigSchema = z.object({
   tags: z.array(z.string()).optional(),
   // LANGFUSE_CODEX_METADATA (JSON object; values coerced to strings)
   metadata: z.record(z.string(), z.string()).optional(),
+  // LANGFUSE_CODEX_TRACE_SEED — deterministic trace ids derived from this seed
+  trace_seed: z.string().optional(),
   // LANGFUSE_CODEX_MAX_CHARS — truncate large inputs/outputs
   max_chars: z.number().int().positive(),
   // LANGFUSE_CODEX_DEBUG
@@ -184,6 +186,7 @@ function readEnvConfig(env: Record<string, string | undefined>): Partial<Config>
       user_id: env.LANGFUSE_CODEX_USER_ID,
       tags: parseTags(env.LANGFUSE_CODEX_TAGS),
       metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
+      trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
       max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
       debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG),
       fail_on_error: parseBoolean(env.LANGFUSE_CODEX_FAIL_ON_ERROR),

@@ -4274,6 +4274,7 @@ const ConfigSchema = object({
 	user_id: string().optional(),
 	tags: array(string()).optional(),
 	metadata: record(string(), string()).optional(),
+	trace_seed: string().optional(),
 	max_chars: number().int().positive(),
 	debug: boolean(),
 	fail_on_error: boolean()
@@ -4391,6 +4392,7 @@ function readEnvConfig(env) {
 		user_id: env.LANGFUSE_CODEX_USER_ID,
 		tags: parseTags(env.LANGFUSE_CODEX_TAGS),
 		metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
+		trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
 		max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
 		debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG),
 		fail_on_error: parseBoolean(env.LANGFUSE_CODEX_FAIL_ON_ERROR)
@@ -46540,6 +46542,17 @@ function startObservation(name, attributes, options) {
 		});
 	}
 }
+async function createTraceId(seed) {
+	if (seed) {
+		const data = new TextEncoder().encode(seed);
+		const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+		return uint8ArrayToHex(new Uint8Array(hashBuffer)).slice(0, 32);
+	}
+	return uint8ArrayToHex(crypto.getRandomValues(new Uint8Array(16)));
+}
+function uint8ArrayToHex(array$1) {
+	return Array.from(array$1).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 //#endregion
 //#region src/utils.ts
@@ -46704,7 +46717,8 @@ function parseSession(lines) {
 				sessionId: typeof p.id === "string" ? p.id : sessionMeta.sessionId,
 				cliVersion: p.cli_version,
 				modelProvider: p.model_provider ?? void 0,
-				baseInstructions: p.base_instructions?.text
+				baseInstructions: p.base_instructions?.text,
+				isSubagentThread: typeof p.parent_thread_id === "string" || p.thread_source === "subagent"
 			};
 			continue;
 		}
@@ -46843,6 +46857,7 @@ async function markTurnUploaded(rolloutFile, turnId) {
 
 //#endregion
 //#region src/trace.ts
+init_esm$2();
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
@@ -46881,6 +46896,39 @@ async function findSubagentRollout(parentFile, threadId) {
 		}
 	}
 	return walk(root);
+}
+/**
+* Placeholder parent span id used to pin a deterministic trace id on a root
+* span (the pattern the Langfuse SDK documents for custom trace ids). The id
+* never exists as a real span, so Langfuse still renders the turn as the
+* trace root.
+*/
+const SEED_PARENT_SPAN_ID = "0123456789abcdef";
+/**
+* Derive the deterministic trace id for a turn from `config.trace_seed`.
+*
+* Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
+* Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
+*
+* The main-thread form deliberately excludes the thread id so external systems
+* can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
+* thread exists. Returns `undefined` (auto-generated ids) when no seed is set
+* or derivation fails — the hook must never block an upload.
+*/
+async function seededTraceParent(config$1, sessionMeta, turnNumber) {
+	if (!config$1.trace_seed) return void 0;
+	try {
+		return {
+			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${config$1.trace_seed}:${sessionMeta.sessionId}:${turnNumber}` : `${config$1.trace_seed}:${turnNumber}`),
+			spanId: SEED_PARENT_SPAN_ID,
+			traceFlags: TraceFlags.SAMPLED,
+			isRemote: true
+		};
+	} catch (error) {
+		debugLog("failed to derive seeded trace id; falling back to auto-generated:", error);
+		if (config$1.fail_on_error) throw error;
+		return;
+	}
 }
 function toUsageDetails(usage) {
 	if (!usage) return void 0;
@@ -46932,7 +46980,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	}, {
 		asType: "agent",
 		startTime: new Date(turn.startTime),
-		parentSpanContext: ctx.parentObservation?.otelSpan.spanContext()
+		parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent
 	});
 	let previousToolResults = void 0;
 	for (let i = 0; i < turn.steps.length; i++) {
@@ -47001,8 +47049,10 @@ async function convertRollout(rolloutFile, options) {
 		return;
 	}
 	const uploaded = await loadUploadedTurnIds(rolloutFile);
-	for (const turn of turns) {
+	for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
+		const turn = turns[turnIndex];
 		if (turn.completed && turn.turnId && uploaded.has(turn.turnId)) continue;
+		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
 		await propagateAttributes({
 			sessionId: sessionMeta.sessionId,
 			traceName: "Codex Turn",
@@ -47012,7 +47062,8 @@ async function convertRollout(rolloutFile, options) {
 		}, async () => {
 			await emitTurn(turn, sessionMeta, {
 				config: options.config,
-				rolloutFile
+				rolloutFile,
+				seededParent
 			});
 		});
 		if (turn.completed && turn.turnId) {

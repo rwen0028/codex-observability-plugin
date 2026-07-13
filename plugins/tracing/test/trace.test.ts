@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,6 +36,13 @@ function stageFixtures(): string {
   fs.cpSync(fixturesRoot, path.join(dir, "sessions"), { recursive: true });
   return path.join(dir, "sessions", "2026", "06", "03");
 }
+
+/**
+ * The derivation external systems use to precompute a seeded trace id —
+ * intentionally independent of the Langfuse SDK helper the plugin calls.
+ */
+const seededTraceId = (seed: string): string =>
+  createHash("sha256").update(seed).digest("hex").slice(0, 32);
 
 const attr = (span: ReadableSpan, key: string): string =>
   span.attributes[key] == null ? "" : String(span.attributes[key]);
@@ -137,5 +145,119 @@ describe("convertRollout", () => {
     exporter.reset();
     await convertRollout(file, { config: baseConfig });
     expect(exporter.getFinishedSpans()).toHaveLength(0);
+  });
+});
+
+describe("deterministic trace ids (trace_seed)", () => {
+  const seed = "ci-run-42";
+  const seededConfig: Config = { ...baseConfig, trace_seed: seed };
+
+  const turnRoots = () =>
+    exporter
+      .getFinishedSpans()
+      .filter((s) => s.name === "Codex Turn")
+      .sort((a, b) => startMs(a) - startMs(b));
+
+  it("derives the N-th main-thread turn's trace id from `${seed}:${N}`", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-two-turns-main.jsonl"), {
+      config: seededConfig,
+    });
+
+    const roots = turnRoots();
+    expect(roots).toHaveLength(2);
+    expect(roots[0].spanContext().traceId).toBe(seededTraceId(`${seed}:1`));
+    expect(roots[1].spanContext().traceId).toBe(seededTraceId(`${seed}:2`));
+
+    // Every span (generations included) lands in one of the two seeded traces.
+    const traceIds = new Set(exporter.getFinishedSpans().map((s) => s.spanContext().traceId));
+    expect([...traceIds].sort()).toEqual(
+      [seededTraceId(`${seed}:1`), seededTraceId(`${seed}:2`)].sort(),
+    );
+  });
+
+  it("keeps generations and tool spans in the seeded trace", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-basic-main.jsonl"), { config: seededConfig });
+
+    const spans = exporter.getFinishedSpans();
+    const expected = seededTraceId(`${seed}:1`);
+    expect(spans.length).toBeGreaterThan(2); // root + generations + tool
+    for (const span of spans) {
+      expect(span.spanContext().traceId).toBe(expected);
+    }
+    // Structure is unchanged: root agent span with its generations beneath it.
+    const root = spans.find((s) => s.name === "Codex Turn")!;
+    expect(obsType(root)).toBe("agent");
+    const generations = spans.filter((s) => obsType(s) === "generation");
+    expect(generations).toHaveLength(2);
+    for (const gen of generations) {
+      expect(parentId(gen)).toBe(root.spanContext().spanId);
+    }
+  });
+
+  it("scopes subagent-thread rollouts by thread id so they don't collide", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-child-thread-child.jsonl"), {
+      config: seededConfig,
+    });
+
+    const roots = turnRoots();
+    expect(roots).toHaveLength(1);
+    expect(roots[0].spanContext().traceId).toBe(seededTraceId(`${seed}:thread-child:1`));
+    expect(roots[0].spanContext().traceId).not.toBe(seededTraceId(`${seed}:1`));
+  });
+
+  it("nests subagent turns inside the parent's seeded trace", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-parent.jsonl"), { config: seededConfig });
+
+    const roots = turnRoots();
+    expect(roots).toHaveLength(2); // parent turn + nested subagent turn
+    const expected = seededTraceId(`${seed}:1`);
+    for (const root of roots) {
+      expect(root.spanContext().traceId).toBe(expected);
+    }
+  });
+
+  it("leaves trace ids auto-generated when the seed is unset", async () => {
+    const dir = stageFixtures();
+    await convertRollout(path.join(dir, "rollout-two-turns-main.jsonl"), { config: baseConfig });
+
+    const roots = turnRoots();
+    expect(roots).toHaveLength(2);
+    for (const root of roots) {
+      // Same shape as before the feature: true root span, random trace id.
+      expect(parentId(root)).toBeUndefined();
+      expect(root.spanContext().traceId).not.toBe(seededTraceId(`${seed}:1`));
+      expect(root.spanContext().traceId).not.toBe(seededTraceId(`${seed}:2`));
+    }
+    expect(roots[0].spanContext().traceId).not.toBe(roots[1].spanContext().traceId);
+  });
+
+  it("keeps sidecar dedup working when a seed is set", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-two-turns-main.jsonl");
+
+    await convertRollout(file, { config: seededConfig });
+    expect(turnRoots()).toHaveLength(2);
+    expect(fs.existsSync(`${file}.langfuse`)).toBe(true);
+
+    exporter.reset();
+    await convertRollout(file, { config: seededConfig });
+    expect(exporter.getFinishedSpans()).toHaveLength(0);
+  });
+
+  it("numbers turns over the full rollout even when earlier turns are deduped", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-two-turns-main.jsonl");
+
+    // Pretend turn 1 was uploaded by a previous hook invocation.
+    fs.writeFileSync(`${file}.langfuse`, "turn-a\n");
+    await convertRollout(file, { config: seededConfig });
+
+    const roots = turnRoots();
+    expect(roots).toHaveLength(1);
+    expect(roots[0].spanContext().traceId).toBe(seededTraceId(`${seed}:2`));
   });
 });

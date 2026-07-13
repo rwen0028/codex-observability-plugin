@@ -158,12 +158,15 @@ export function parseSession(lines: RolloutLine[]): {
         cli_version?: string;
         model_provider?: string | null;
         base_instructions?: { text?: string } | null;
+        parent_thread_id?: string | null;
+        thread_source?: string | null;
       };
       sessionMeta = {
         sessionId: typeof p.id === "string" ? p.id : sessionMeta.sessionId,
         cliVersion: p.cli_version,
         modelProvider: p.model_provider ?? undefined,
         baseInstructions: p.base_instructions?.text,
+        isSubagentThread: typeof p.parent_thread_id === "string" || p.thread_source === "subagent",
       };
       continue;
     }

@@ -141,6 +141,12 @@ export type SessionMeta = {
   cliVersion?: string;
   modelProvider?: string;
   baseInstructions?: string;
+  /**
+   * Whether this rollout belongs to a subagent thread rather than the main
+   * session. Codex marks subagent rollouts with `parent_thread_id` and/or
+   * `thread_source: "subagent"` in `session_meta`.
+   */
+  isSubagentThread?: boolean;
 };
 
 /** A single tool invocation, assembled from response items + event_msg. */

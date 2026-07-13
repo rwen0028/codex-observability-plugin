@@ -2,7 +2,13 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { propagateAttributes, startObservation, type LangfuseObservation } from "@langfuse/tracing";
+import {
+  createTraceId,
+  propagateAttributes,
+  startObservation,
+  type LangfuseObservation,
+} from "@langfuse/tracing";
+import { TraceFlags, type SpanContext } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
 import { parseSession } from "./parse.js";
@@ -61,6 +67,48 @@ async function findSubagentRollout(
   return walk(root);
 }
 
+/**
+ * Placeholder parent span id used to pin a deterministic trace id on a root
+ * span (the pattern the Langfuse SDK documents for custom trace ids). The id
+ * never exists as a real span, so Langfuse still renders the turn as the
+ * trace root.
+ */
+const SEED_PARENT_SPAN_ID = "0123456789abcdef";
+
+/**
+ * Derive the deterministic trace id for a turn from `config.trace_seed`.
+ *
+ * Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
+ * Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
+ *
+ * The main-thread form deliberately excludes the thread id so external systems
+ * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
+ * thread exists. Returns `undefined` (auto-generated ids) when no seed is set
+ * or derivation fails — the hook must never block an upload.
+ */
+async function seededTraceParent(
+  config: Config,
+  sessionMeta: SessionMeta,
+  turnNumber: number,
+): Promise<SpanContext | undefined> {
+  if (!config.trace_seed) return undefined;
+  try {
+    const seed = sessionMeta.isSubagentThread
+      ? `${config.trace_seed}:${sessionMeta.sessionId}:${turnNumber}`
+      : `${config.trace_seed}:${turnNumber}`;
+    return {
+      traceId: await createTraceId(seed),
+      spanId: SEED_PARENT_SPAN_ID,
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    };
+  } catch (error) {
+    debugLog("failed to derive seeded trace id; falling back to auto-generated:", error);
+    if (config.fail_on_error) throw error;
+    return undefined;
+  }
+}
+
 function toUsageDetails(usage: TokenUsage | undefined): Record<string, number> | undefined {
   if (!usage) return undefined;
   const details: Record<string, number> = {};
@@ -115,6 +163,8 @@ async function emitTurn(
     config: Config;
     rolloutFile: string;
     parentObservation?: LangfuseObservation;
+    /** Pre-derived trace id for top-level turns (see seededTraceParent). */
+    seededParent?: SpanContext;
   },
 ): Promise<void> {
   const clip = makeClip(ctx.config.max_chars);
@@ -139,7 +189,7 @@ async function emitTurn(
     {
       asType: "agent",
       startTime: new Date(turn.startTime),
-      parentSpanContext: ctx.parentObservation?.otelSpan.spanContext(),
+      parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent,
     },
   );
 
@@ -249,10 +299,15 @@ export async function convertRollout(
 
   const uploaded = await loadUploadedTurnIds(rolloutFile);
 
-  for (const turn of turns) {
+  for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
+    const turn = turns[turnIndex];
     if (turn.completed && turn.turnId && uploaded.has(turn.turnId)) {
       continue; // already uploaded in a previous hook invocation
     }
+
+    // Turn numbering stays 1-based over the full rollout (including turns
+    // skipped by dedup above) so the derived id is stable across hook runs.
+    const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
 
     await propagateAttributes(
       {
@@ -266,6 +321,7 @@ export async function convertRollout(
         await emitTurn(turn, sessionMeta, {
           config: options.config,
           rolloutFile,
+          seededParent,
         });
       },
     );

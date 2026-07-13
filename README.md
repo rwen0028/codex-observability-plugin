@@ -83,19 +83,20 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 
 ## Environment variables
 
-| Variable                                                      | Required | Default                      | Description                                              |
-| ------------------------------------------------------------- | -------- | ---------------------------- | -------------------------------------------------------- |
-| `TRACE_TO_LANGFUSE`                                           | Yes      | `false`                      | Set to `"true"` to enable tracing                        |
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | Yes      | —                            | Langfuse public key (`pk-lf-...`)                        |
-| `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | Yes      | —                            | Langfuse secret key (`sk-lf-...`)                        |
-| `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | No       | `https://cloud.langfuse.com` | Langfuse host / data region                              |
-| `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | No       | —                            | Environment label for the traces (e.g. `production`)     |
-| `LANGFUSE_CODEX_USER_ID`                                      | No       | Codex auth email, if found   | Attach a user id to all traces                           |
-| `LANGFUSE_CODEX_TAGS`                                         | No       | —                            | Tags for all traces (JSON array or comma-separated)      |
-| `LANGFUSE_CODEX_METADATA`                                     | No       | —                            | JSON object of metadata to attach to all traces          |
-| `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                      | Truncate inputs/outputs longer than this many characters |
-| `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                      | Set to `"true"` for verbose logging to stderr            |
-| `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                      | Set to `"true"` to make hook upload errors fail the hook |
+| Variable                                                      | Required | Default                      | Description                                                          |
+| ------------------------------------------------------------- | -------- | ---------------------------- | -------------------------------------------------------------------- |
+| `TRACE_TO_LANGFUSE`                                           | Yes      | `false`                      | Set to `"true"` to enable tracing                                    |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | Yes      | —                            | Langfuse public key (`pk-lf-...`)                                    |
+| `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | Yes      | —                            | Langfuse secret key (`sk-lf-...`)                                    |
+| `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | No       | `https://cloud.langfuse.com` | Langfuse host / data region                                          |
+| `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | No       | —                            | Environment label for the traces (e.g. `production`)                 |
+| `LANGFUSE_CODEX_USER_ID`                                      | No       | Codex auth email, if found   | Attach a user id to all traces                                       |
+| `LANGFUSE_CODEX_TAGS`                                         | No       | —                            | Tags for all traces (JSON array or comma-separated)                  |
+| `LANGFUSE_CODEX_METADATA`                                     | No       | —                            | JSON object of metadata to attach to all traces                      |
+| `LANGFUSE_CODEX_TRACE_SEED`                                   | No       | —                            | Derive deterministic trace ids ([details](#deterministic-trace-ids)) |
+| `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                      | Truncate inputs/outputs longer than this many characters             |
+| `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                      | Set to `"true"` for verbose logging to stderr                        |
+| `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                      | Set to `"true"` to make hook upload errors fail the hook             |
 
 ### Data regions
 
@@ -105,6 +106,45 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | 🇺🇸 US    | `https://us.cloud.langfuse.com`    |
 | 🇯🇵 Japan | `https://jp.cloud.langfuse.com`    |
 | ⚕️ HIPAA | `https://hipaa.cloud.langfuse.com` |
+
+## Deterministic trace ids
+
+By default, trace ids are auto-generated, and an external system (a CI harness, benchmark runner, or dataset-experiment service) that runs `codex exec` headlessly has to poll the Langfuse API to discover the trace a run produced. Set `LANGFUSE_CODEX_TRACE_SEED` (or `trace_seed` in `langfuse.json`) to make trace ids predictable instead:
+
+- **Turn N of the main thread** (1-based, in rollout order) gets the trace id `hex(sha256("<seed>:<N>")).slice(0, 32)`.
+- **Turn N of a subagent thread** gets `hex(sha256("<seed>:<childThreadId>:<N>")).slice(0, 32)`, scoped by the subagent's thread id so it cannot collide with main-thread ids. (Subagent turns spawned _within_ a main-thread turn are nested inside that turn's trace as usual and don't get their own trace id.)
+
+The main-thread formula deliberately excludes the Codex thread id, so you can compute the trace id **before** the run starts — no thread id, no polling. The derivation matches the Langfuse SDKs' `createTraceId(seed)` helper and always yields a valid W3C trace id.
+
+**Use a unique seed per session** (e.g. a UUID or your job/run id). Reusing a seed across sessions produces colliding trace ids, and the second upload would merge into (and overwrite parts of) the first trace.
+
+If derivation ever fails, the hook falls back to auto-generated ids and still uploads — it never blocks the session (set `LANGFUSE_CODEX_FAIL_ON_ERROR=true` while testing to surface such errors).
+
+### Example: link a Codex run to a dataset run item
+
+A harness can compute the trace id up front and register it with a [dataset run](https://langfuse.com/docs/evaluation/dataset-runs/native-run) — without ever fetching traces:
+
+```bash
+SEED="$(uuidgen)" # unique per codex exec invocation
+
+# Trace id of the first main-thread turn: hex(sha256("<seed>:1")).slice(0, 32)
+TRACE_ID=$(printf '%s:1' "$SEED" | shasum -a 256 | cut -c1-32)
+
+# Link the precomputed trace id to a dataset run item before (or after) the run.
+curl -s -X POST "$LANGFUSE_BASE_URL/api/public/dataset-run-items" \
+  -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"runName\": \"codex-benchmark-2026-07-13\",
+    \"datasetItemId\": \"$DATASET_ITEM_ID\",
+    \"traceId\": \"$TRACE_ID\"
+  }"
+
+# Run Codex; the Stop hook uploads the turn with exactly $TRACE_ID.
+LANGFUSE_CODEX_TRACE_SEED="$SEED" codex exec "your prompt"
+```
+
+The same works from JavaScript with the Langfuse SDK: `await createTraceId(`${seed}:1`)` (from `@langfuse/tracing`) returns the identical id.
 
 ## JSON config reference
 
@@ -118,6 +158,7 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | `user_id`       | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found   | User id for all traces            |
 | `tags`          | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
 | `metadata`      | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
+| `trace_seed`    | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                            | Deterministic trace-id seed       |
 | `max_chars`     | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
 | `debug`         | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
 | `fail_on_error` | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                      | Fail the hook on upload errors    |

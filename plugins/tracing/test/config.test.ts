@@ -193,6 +193,26 @@ describe("getConfig", () => {
     expect(config.enabled).toBe(false);
   });
 
+  it("leaves trace_seed unset by default and reads it from config files and env", async () => {
+    const unset = await getConfig({ home: emptyHome(), cwd: emptyHome(), env: {} });
+    expect(unset.trace_seed).toBeUndefined();
+
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { trace_seed: "seed-from-file" },
+    });
+
+    const fromFile = await getConfig({ home, cwd: emptyHome(), env: {} });
+    expect(fromFile.trace_seed).toBe("seed-from-file");
+
+    const fromEnv = await getConfig({
+      home,
+      cwd: emptyHome(),
+      env: { LANGFUSE_CODEX_TRACE_SEED: "seed-from-env" },
+    });
+    expect(fromEnv.trace_seed).toBe("seed-from-env");
+  });
+
   it("parses fail-on-error from config and environment", async () => {
     const home = makeTmpHome({
       rel: ".codex/langfuse.json",

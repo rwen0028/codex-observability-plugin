@@ -1,4 +1,4 @@
-{"timestamp":"2026-06-03T11:00:03.000Z","type":"session_meta","payload":{"id":"thread-child","cli_version":"0.123.0","model_provider":"openai"}}
+{"timestamp":"2026-06-03T11:00:03.000Z","type":"session_meta","payload":{"id":"thread-child","cli_version":"0.123.0","model_provider":"openai","parent_thread_id":"sess-parent","thread_source":"subagent"}}
 {"timestamp":"2026-06-03T11:00:03.100Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-child"}}
 {"timestamp":"2026-06-03T11:00:03.200Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
 {"timestamp":"2026-06-03T11:00:03.300Z","type":"event_msg","payload":{"type":"user_message","message":"tell a joke"}}
