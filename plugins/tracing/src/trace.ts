@@ -16,6 +16,13 @@ import { loadUploadedTurnIds, markTurnUploaded } from "./sidecar.js";
 import type { ModelStep, RolloutLine, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
 import { debugLog, toText, truncate } from "./utils.js";
 
+/**
+ * Stamped into every emitted trace so uploads self-identify which build
+ * produced them: a trace without this field came from a plugin build that
+ * still traces each turn more than once.
+ */
+const TRACE_PATCH_VERSION = "2.0.0";
+
 async function loadSession(file: string): Promise<RolloutLine[]> {
   const data = await fs.readFile(file, "utf-8");
   const lines: RolloutLine[] = [];
@@ -200,6 +207,7 @@ async function emitTurn(
         "codex.cli_version": sessionMeta.cliVersion,
         "codex.aborted": turn.aborted,
         "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
+        "cctrace.patch": TRACE_PATCH_VERSION,
       },
     },
     {
@@ -317,8 +325,21 @@ export async function convertRollout(
 
   for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
     const turn = turns[turnIndex];
-    if (turn.completed && turn.turnId && uploaded.has(turn.turnId)) {
+    if (turn.turnId && uploaded.has(turn.turnId)) {
       continue; // already uploaded in a previous hook invocation
+    }
+
+    // Lifecycle events written after `task_complete` / `turn_aborted` parse into
+    // an anonymous turn with no content. It carries no turn id, so the sidecar
+    // can never dedup it: tracing it would add an empty trace on every Stop.
+    if (
+      !turn.turnId &&
+      turn.userInput == null &&
+      turn.finalOutput == null &&
+      turn.steps.length === 0 &&
+      turn.subagentThreadIds.length === 0
+    ) {
+      continue;
     }
 
     // Turn numbering stays 1-based over the full rollout (including turns
@@ -342,15 +363,13 @@ export async function convertRollout(
       },
     );
 
-    // Only mark completed turns as uploaded; an in-progress trailing turn is
-    // re-uploaded (and finalized) on the next hook invocation.
-    if (turn.completed && turn.turnId) {
+    // Record every turn we upload, completed or not. Codex fires `Stop` before
+    // the just-ended turn's `task_complete` reaches the rollout, so waiting for
+    // `completed` before recording means the next Stop sees an unrecorded turn
+    // and uploads it again — as a new trace, not an update.
+    if (turn.turnId) {
       uploaded.add(turn.turnId);
       await markTurnUploaded(rolloutFile, turn.turnId);
-    } else if (turn.turnId) {
-      debugLog(
-        `uploaded in-progress turn ${turn.turnId}; waiting for completion before sidecar mark`,
-      );
     }
   }
 }

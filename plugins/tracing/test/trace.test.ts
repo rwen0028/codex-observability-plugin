@@ -172,6 +172,32 @@ describe("convertRollout", () => {
     await convertRollout(file, { config: baseConfig });
     expect(exporter.getFinishedSpans()).toHaveLength(0);
   });
+
+  // Codex fires `Stop` before the just-ended turn's `task_complete` reaches the
+  // rollout, so every Stop sees that turn as in-progress. Uploading such a turn
+  // without recording it re-uploads it as a *new* trace on the next Stop.
+  it("traces a turn exactly once when Stop fires before task_complete lands", async () => {
+    const dir = stageFixtures();
+    const lines = fs
+      .readFileSync(path.join(dir, "rollout-basic-main.jsonl"), "utf-8")
+      .split("\n")
+      .filter(Boolean);
+    expect(JSON.parse(lines[lines.length - 1]).payload.type).toBe("task_complete");
+
+    const file = path.join(dir, "rollout-inflight-main.jsonl");
+    const turnRoots = () => exporter.getFinishedSpans().filter((s) => s.name === "Codex Turn");
+
+    // Stop #1: the turn has ended but `task_complete` is not flushed yet.
+    fs.writeFileSync(file, `${lines.slice(0, -1).join("\n")}\n`);
+    await convertRollout(file, { config: baseConfig });
+    expect(turnRoots()).toHaveLength(1);
+
+    // Stop #2: `task_complete` has landed. The same turn must not be traced again.
+    exporter.reset();
+    fs.writeFileSync(file, `${lines.join("\n")}\n`);
+    await convertRollout(file, { config: baseConfig });
+    expect(turnRoots()).toHaveLength(0);
+  });
 });
 
 describe("deterministic trace ids (trace_seed)", () => {

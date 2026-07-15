@@ -46909,6 +46909,12 @@ async function markTurnUploaded(rolloutFile, turnId) {
 //#endregion
 //#region src/trace.ts
 init_esm$2();
+/**
+* Stamped into every emitted trace so uploads self-identify which build
+* produced them: a trace without this field came from a plugin build that
+* still traces each turn more than once.
+*/
+const TRACE_PATCH_VERSION = "2.0.0";
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
@@ -47038,7 +47044,8 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			"codex.model_provider": sessionMeta.modelProvider,
 			"codex.cli_version": sessionMeta.cliVersion,
 			"codex.aborted": turn.aborted,
-			"codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0)
+			"codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
+			"cctrace.patch": TRACE_PATCH_VERSION
 		}
 	}, {
 		asType: "agent",
@@ -47117,7 +47124,8 @@ async function convertRollout(rolloutFile, options) {
 	const uploaded = await loadUploadedTurnIds(rolloutFile);
 	for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
 		const turn = turns[turnIndex];
-		if (turn.completed && turn.turnId && uploaded.has(turn.turnId)) continue;
+		if (turn.turnId && uploaded.has(turn.turnId)) continue;
+		if (!turn.turnId && turn.userInput == null && turn.finalOutput == null && turn.steps.length === 0 && turn.subagentThreadIds.length === 0) continue;
 		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
 		await propagateAttributes({
 			sessionId: sessionMeta.sessionId,
@@ -47132,10 +47140,10 @@ async function convertRollout(rolloutFile, options) {
 				seededParent
 			});
 		});
-		if (turn.completed && turn.turnId) {
+		if (turn.turnId) {
 			uploaded.add(turn.turnId);
 			await markTurnUploaded(rolloutFile, turn.turnId);
-		} else if (turn.turnId) debugLog(`uploaded in-progress turn ${turn.turnId}; waiting for completion before sidecar mark`);
+		}
 	}
 }
 
