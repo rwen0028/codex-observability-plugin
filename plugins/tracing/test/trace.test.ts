@@ -217,6 +217,28 @@ describe("convertRollout", () => {
     await convertRollout(file, { config: baseConfig });
     expect(exporter.getFinishedSpans()).toHaveLength(0);
   });
+
+  // Guard the other side of the emptiness filter: an aborted turn that DID
+  // record something (here: reasoning, so steps.length > 0) is real work and
+  // must still be traced. Interruption alone must never suppress a turn.
+  it("still traces an aborted turn that recorded reasoning", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-aborted-with-reasoning-main.jsonl");
+    fs.writeFileSync(
+      file,
+      [
+        '{"timestamp":"2026-06-03T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-abort-reasoning","cli_version":"0.144.0","model_provider":"openai"}}',
+        '{"timestamp":"2026-06-03T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}',
+        '{"timestamp":"2026-06-03T10:00:02.000Z","type":"response_item","payload":{"type":"reasoning","content":"Thinking about the request."}}',
+        '{"timestamp":"2026-06-03T10:00:03.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1"}}',
+      ].join("\n") + "\n",
+    );
+
+    await convertRollout(file, { config: baseConfig });
+    const root = exporter.getFinishedSpans().find((s) => s.name === "Codex Turn");
+    expect(root, "an aborted turn with reasoning must still be traced").toBeDefined();
+    expect(attr(root!, "langfuse.observation.level")).toBe("WARNING"); // marked interrupted
+  });
 });
 
 describe("deterministic trace ids (trace_seed)", () => {
