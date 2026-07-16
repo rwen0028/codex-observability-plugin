@@ -21,7 +21,7 @@ import { debugLog, toText, truncate } from "./utils.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.0.0";
+const TRACE_PATCH_VERSION = "2.1.0";
 
 async function loadSession(file: string): Promise<RolloutLine[]> {
   const data = await fs.readFile(file, "utf-8");
@@ -329,11 +329,13 @@ export async function convertRollout(
       continue; // already uploaded in a previous hook invocation
     }
 
-    // Lifecycle events written after `task_complete` / `turn_aborted` parse into
-    // an anonymous turn with no content. It carries no turn id, so the sidecar
-    // can never dedup it: tracing it would add an empty trace on every Stop.
+    // A turn with nothing in it carries no information: lifecycle events written
+    // after `task_complete` / `turn_aborted` parse into one, as does a turn
+    // aborted before it recorded anything. Codex 0.144 gives those events a turn
+    // id, so a missing id no longer identifies them. Skip before uploading AND
+    // before recording, so a turn that only looks empty because its content has
+    // not been flushed yet is still traced in full on a later Stop.
     if (
-      !turn.turnId &&
       turn.userInput == null &&
       turn.finalOutput == null &&
       turn.steps.length === 0 &&

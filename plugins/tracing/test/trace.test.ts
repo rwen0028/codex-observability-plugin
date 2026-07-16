@@ -198,6 +198,25 @@ describe("convertRollout", () => {
     await convertRollout(file, { config: baseConfig });
     expect(turnRoots()).toHaveLength(0);
   });
+
+  // A turn that recorded nothing carries no information, and Codex 0.144 gives
+  // its post-turn lifecycle events a turn id — so contentless turns are no
+  // longer always anonymous and cannot be recognised by a missing id alone.
+  it("does not trace a turn that has no content, even with a turn id", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-aborted-empty-main.jsonl");
+    fs.writeFileSync(
+      file,
+      [
+        '{"timestamp":"2026-06-03T10:00:00.000Z","type":"session_meta","payload":{"id":"sess-empty-abort","cli_version":"0.144.0","model_provider":"openai"}}',
+        '{"timestamp":"2026-06-03T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}',
+        '{"timestamp":"2026-06-03T10:00:01.500Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1"}}',
+      ].join("\n") + "\n",
+    );
+
+    await convertRollout(file, { config: baseConfig });
+    expect(exporter.getFinishedSpans()).toHaveLength(0);
+  });
 });
 
 describe("deterministic trace ids (trace_seed)", () => {

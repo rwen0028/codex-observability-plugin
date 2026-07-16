@@ -46914,7 +46914,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.0.0";
+const TRACE_PATCH_VERSION = "2.1.0";
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
@@ -47125,7 +47125,7 @@ async function convertRollout(rolloutFile, options) {
 	for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
 		const turn = turns[turnIndex];
 		if (turn.turnId && uploaded.has(turn.turnId)) continue;
-		if (!turn.turnId && turn.userInput == null && turn.finalOutput == null && turn.steps.length === 0 && turn.subagentThreadIds.length === 0) continue;
+		if (turn.userInput == null && turn.finalOutput == null && turn.steps.length === 0 && turn.subagentThreadIds.length === 0) continue;
 		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
 		await propagateAttributes({
 			sessionId: sessionMeta.sessionId,
