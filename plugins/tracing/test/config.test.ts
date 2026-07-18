@@ -39,6 +39,8 @@ describe("getConfig", () => {
     expect(config.base_url).toBe("https://cloud.langfuse.com");
     expect(config.max_chars).toBe(20_000);
     expect(config.fail_on_error).toBe(false);
+    expect(config.pricing_mode).toBe("standard");
+    expect(config.regional_processing).toBe(false);
   });
 
   it("reads credentials and enable flag from environment variables", async () => {
@@ -228,5 +230,27 @@ describe("getConfig", () => {
       env: { LANGFUSE_CODEX_FAIL_ON_ERROR: "false" },
     });
     expect(fromEnv.fail_on_error).toBe(false);
+  });
+
+  it("reads pricing mode and regional processing with env precedence", async () => {
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { pricing_mode: "batch", regional_processing: false },
+    });
+
+    const fromFile = await getConfig({ home, cwd: emptyHome(), env: {} });
+    expect(fromFile.pricing_mode).toBe("batch");
+    expect(fromFile.regional_processing).toBe(false);
+
+    const fromEnv = await getConfig({
+      home,
+      cwd: emptyHome(),
+      env: {
+        LANGFUSE_CODEX_PRICING_MODE: "priority",
+        LANGFUSE_CODEX_REGIONAL_PROCESSING: "true",
+      },
+    });
+    expect(fromEnv.pricing_mode).toBe("priority");
+    expect(fromEnv.regional_processing).toBe(true);
   });
 });

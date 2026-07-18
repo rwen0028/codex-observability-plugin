@@ -24,6 +24,8 @@ const baseConfig: Config = {
   secret_key: "sk-lf-test",
   base_url: "https://cloud.langfuse.com",
   max_chars: 20_000,
+  pricing_mode: "standard",
+  regional_processing: false,
   debug: false,
   fail_on_error: false,
 };
@@ -105,6 +107,36 @@ describe("convertRollout", () => {
     expect(attr(tools[0], "langfuse.observation.metadata.codex.tool_name")).toBe("exec_command");
     expect(attr(tools[0], "langfuse.observation.output")).toContain("file1.txt");
     expect(generations.map((g) => g.spanContext().spanId)).toContain(parentId(tools[0]));
+  });
+
+  it("emits explicit GPT-5.6 cost details and auditable pricing metadata", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+    const rollout = fs.readFileSync(file, "utf-8").replaceAll("gpt-5.4", "gpt-5.6-sol");
+    fs.writeFileSync(file, rollout);
+
+    await convertRollout(file, { config: baseConfig });
+
+    const generation = exporter
+      .getFinishedSpans()
+      .filter((span) => obsType(span) === "generation")
+      .find((span) => attr(span, "langfuse.observation.usage_details").includes("120"));
+    expect(generation).toBeDefined();
+
+    const costs = JSON.parse(attr(generation!, "langfuse.observation.cost_details")) as Record<
+      string,
+      number
+    >;
+    expect(costs.input).toBeCloseTo(0.0005, 12);
+    expect(costs.input_cached).toBe(0);
+    expect(costs.output).toBeCloseTo(0.00045, 12);
+    expect(costs.output_reasoning).toBeCloseTo(0.00015, 12);
+    expect(attr(generation!, "langfuse.observation.metadata.cctrace.pricing_source")).toBe(
+      "openai-official-2026-07-09",
+    );
+    expect(attr(generation!, "langfuse.observation.metadata.cctrace.pricing_mode")).toBe(
+      "standard",
+    );
   });
 
   it("nests subagent turns under the spawning turn and marks errors/interruptions", async () => {

@@ -115,6 +115,9 @@ export type TokenUsage = {
   output_tokens?: number;
   total_tokens?: number;
   cached_input_tokens?: number;
+  /** Future-proof both common provider spellings; current Codex omits this. */
+  cache_write_input_tokens?: number;
+  cache_creation_input_tokens?: number;
   reasoning_output_tokens?: number;
 };
 

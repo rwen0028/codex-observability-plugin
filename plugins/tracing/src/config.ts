@@ -4,6 +4,8 @@ import * as path from "node:path";
 
 import { z } from "zod";
 
+import type { PricingMode } from "./pricing.js";
+
 /**
  * Resolved tracer configuration.
  *
@@ -33,6 +35,10 @@ export const ConfigSchema = z.object({
   metadata: z.record(z.string(), z.string()).optional(),
   // LANGFUSE_CODEX_TRACE_SEED — deterministic trace ids derived from this seed
   trace_seed: z.string().optional(),
+  // LANGFUSE_CODEX_PRICING_MODE — OpenAI service mode used for list-price cost
+  pricing_mode: z.enum(["standard", "batch", "flex", "priority"]),
+  // LANGFUSE_CODEX_REGIONAL_PROCESSING — OpenAI regional processing adds 10%
+  regional_processing: z.boolean(),
   // LANGFUSE_CODEX_MAX_CHARS — truncate large inputs/outputs
   max_chars: z.number().int().positive(),
   // LANGFUSE_CODEX_DEBUG
@@ -45,9 +51,20 @@ export type Config = z.infer<typeof ConfigSchema>;
 
 const PartialConfigSchema = ConfigSchema.partial();
 
-const DEFAULTS: Pick<Config, "enabled" | "base_url" | "max_chars" | "debug" | "fail_on_error"> = {
+const DEFAULTS: Pick<
+  Config,
+  | "enabled"
+  | "base_url"
+  | "pricing_mode"
+  | "regional_processing"
+  | "max_chars"
+  | "debug"
+  | "fail_on_error"
+> = {
   enabled: false,
   base_url: "https://cloud.langfuse.com",
+  pricing_mode: "standard" satisfies PricingMode,
+  regional_processing: false,
   max_chars: 20_000,
   debug: false,
   fail_on_error: false,
@@ -131,6 +148,8 @@ async function readConfigFile(file: string): Promise<Partial<Config> | undefined
         enabled: raw.enabled != null ? parseBoolean(raw.enabled) : undefined,
         tags: raw.tags != null ? parseTags(raw.tags) : undefined,
         metadata: raw.metadata != null ? parseMetadata(raw.metadata) : undefined,
+        regional_processing:
+          raw.regional_processing != null ? parseBoolean(raw.regional_processing) : undefined,
         max_chars: raw.max_chars != null ? parseInteger(raw.max_chars) : undefined,
         debug: raw.debug != null ? parseBoolean(raw.debug) : undefined,
         fail_on_error: raw.fail_on_error != null ? parseBoolean(raw.fail_on_error) : undefined,
@@ -187,6 +206,8 @@ function readEnvConfig(env: Record<string, string | undefined>): Partial<Config>
       tags: parseTags(env.LANGFUSE_CODEX_TAGS),
       metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
       trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
+      pricing_mode: env.LANGFUSE_CODEX_PRICING_MODE,
+      regional_processing: parseBoolean(env.LANGFUSE_CODEX_REGIONAL_PROCESSING),
       max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
       debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG),
       fail_on_error: parseBoolean(env.LANGFUSE_CODEX_FAIL_ON_ERROR),

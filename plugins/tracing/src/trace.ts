@@ -12,6 +12,7 @@ import { TraceFlags, type SpanContext } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
 import { parseSession } from "./parse.js";
+import { calculateGpt56Cost, normalizeUsage, reasoningEffort } from "./pricing.js";
 import { loadUploadedTurnIds, markTurnUploaded } from "./sidecar.js";
 import type { ModelStep, RolloutLine, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
 import { debugLog, toText, truncate } from "./utils.js";
@@ -21,7 +22,7 @@ import { debugLog, toText, truncate } from "./utils.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.1.0";
+const TRACE_PATCH_VERSION = "2.2.0";
 
 async function loadSession(file: string): Promise<RolloutLine[]> {
   const data = await fs.readFile(file, "utf-8");
@@ -117,18 +118,7 @@ async function seededTraceParent(
 }
 
 function toUsageDetails(usage: TokenUsage | undefined): Record<string, number> | undefined {
-  if (!usage) return undefined;
-  const details: Record<string, number> = {};
-  if (typeof usage.input_tokens === "number") details.input = usage.input_tokens;
-  if (typeof usage.output_tokens === "number") details.output = usage.output_tokens;
-  if (typeof usage.total_tokens === "number") details.total = usage.total_tokens;
-  if (typeof usage.cached_input_tokens === "number") {
-    details.cache_read_input_tokens = usage.cached_input_tokens;
-  }
-  if (typeof usage.reasoning_output_tokens === "number") {
-    details.reasoning_tokens = usage.reasoning_output_tokens;
-  }
-  return Object.keys(details).length > 0 ? details : undefined;
+  return normalizeUsage(usage);
 }
 
 type Clip = {
@@ -221,6 +211,12 @@ async function emitTurn(
 
   for (let i = 0; i < turn.steps.length; i++) {
     const step = turn.steps[i];
+    const usageDetails = toUsageDetails(step.usage);
+    const pricing = calculateGpt56Cost(turn.model, usageDetails, turn, {
+      mode: ctx.config.pricing_mode,
+      regionalProcessing: ctx.config.regional_processing,
+    });
+    const effort = reasoningEffort(turn);
     const generation = startObservation(
       isSubagent ? "LLM Subagent" : "LLM",
       {
@@ -232,8 +228,20 @@ async function emitTurn(
             : previousToolResults,
         output: buildGenerationOutput(step, clip),
         model: turn.model,
-        usageDetails: toUsageDetails(step.usage),
-        metadata: { "codex.step_index": i },
+        usageDetails,
+        costDetails: pricing?.costDetails,
+        metadata: {
+          "codex.step_index": i,
+          ...(effort ? { "codex.reasoning_effort": effort } : {}),
+          ...(pricing
+            ? {
+                "cctrace.pricing_source": "openai-official-2026-07-09",
+                "cctrace.pricing_mode": pricing.mode,
+                "cctrace.pricing_context": pricing.contextTier,
+                "cctrace.pricing_regional": pricing.regionalProcessing,
+              }
+            : {}),
+        },
       },
       {
         asType: "generation",

@@ -66,7 +66,9 @@ Create `~/.codex/langfuse.json` (global) or `<project>/.codex/langfuse.json` (pe
   "enabled": true,
   "public_key": "pk-lf-...",
   "secret_key": "sk-lf-...",
-  "base_url": "https://cloud.langfuse.com"
+  "base_url": "https://cloud.langfuse.com",
+  "pricing_mode": "standard",
+  "regional_processing": false
 }
 ```
 
@@ -94,6 +96,8 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | `LANGFUSE_CODEX_TAGS`                                         | No       | —                            | Tags for all traces (JSON array or comma-separated)                  |
 | `LANGFUSE_CODEX_METADATA`                                     | No       | —                            | JSON object of metadata to attach to all traces                      |
 | `LANGFUSE_CODEX_TRACE_SEED`                                   | No       | —                            | Derive deterministic trace ids ([details](#deterministic-trace-ids)) |
+| `LANGFUSE_CODEX_PRICING_MODE`                                 | No       | `standard`                   | OpenAI service mode: `standard`, `batch`, `flex`, or `priority`      |
+| `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | No       | `false`                      | Add OpenAI's 10% regional-processing surcharge                       |
 | `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                      | Truncate inputs/outputs longer than this many characters             |
 | `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                      | Set to `"true"` for verbose logging to stderr                        |
 | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                      | Set to `"true"` to make hook upload errors fail the hook             |
@@ -106,6 +110,38 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | 🇺🇸 US    | `https://us.cloud.langfuse.com`    |
 | 🇯🇵 Japan | `https://jp.cloud.langfuse.com`    |
 | ⚕️ HIPAA | `https://hipaa.cloud.langfuse.com` |
+
+## GPT-5.6 cost calculation
+
+For `gpt-5.6`/`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, the plugin sends explicit, mutually exclusive `usageDetails` and `costDetails` to Langfuse. Prices are OpenAI's official USD list prices per 1M tokens published on 2026-07-09.
+
+| Standard, input ≤272K | Input | Cached input | Cache write | Output/reasoning |
+| --------------------- | ----: | -----------: | ----------: | ---------------: |
+| Sol                   | $5.00 |        $0.50 |       $6.25 |           $30.00 |
+| Terra                 | $2.50 |        $0.25 |      $3.125 |           $15.00 |
+| Luna                  | $1.00 |        $0.10 |       $1.25 |            $6.00 |
+
+| Standard, input >272K |  Input | Cached input | Cache write | Output/reasoning |
+| --------------------- | -----: | -----------: | ----------: | ---------------: |
+| Sol                   | $10.00 |        $1.00 |      $12.50 |           $45.00 |
+| Terra                 |  $5.00 |        $0.50 |       $6.25 |           $22.50 |
+| Luna                  |  $2.00 |        $0.20 |       $2.50 |            $9.00 |
+
+Service-mode and location adjustments are applied after selecting the model/context row:
+
+| Mode/location       | Multiplier | Notes                                 |
+| ------------------- | ---------: | ------------------------------------- |
+| Standard            |       1.0× | Default                               |
+| Batch               |       0.5× | Short and long context                |
+| Flex                |       0.5× | Short and long context                |
+| Priority            |       2.0× | Short context only                    |
+| Regional processing |       1.1× | Applied in addition to the mode above |
+
+If Codex records `service_tier` in the rollout, that observed value overrides `pricing_mode`; otherwise set `LANGFUSE_CODEX_PRICING_MODE` (or `pricing_mode` in JSON) to match the API route. Enable `regional_processing` only when that OpenAI option is actually used. Unsupported combinations such as Priority with >272K input omit explicit cost instead of inventing a price.
+
+Reasoning effort (`low`, `medium`, `high`, and so on) does not change the per-token rate. Reasoning tokens are a subset of output tokens and are charged at the selected model's output rate. Cached input and cache-write tokens are subtracted from the inclusive input total before costs are calculated, preventing double billing.
+
+Source: [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
 ## Deterministic trace ids
 
@@ -148,20 +184,22 @@ The same works from JavaScript with the Langfuse SDK: `await createTraceId(`${se
 
 ## JSON config reference
 
-| Config key      | Environment variable                                          | Default                      | Description                       |
-| --------------- | ------------------------------------------------------------- | ---------------------------- | --------------------------------- |
-| `enabled`       | `TRACE_TO_LANGFUSE`                                           | `false`                      | Enable tracing                    |
-| `public_key`    | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                            | Langfuse public key               |
-| `secret_key`    | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                            | Langfuse secret key               |
-| `base_url`      | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com` | Langfuse host                     |
-| `environment`   | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                            | Environment label                 |
-| `user_id`       | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found   | User id for all traces            |
-| `tags`          | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
-| `metadata`      | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
-| `trace_seed`    | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                            | Deterministic trace-id seed       |
-| `max_chars`     | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
-| `debug`         | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
-| `fail_on_error` | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                      | Fail the hook on upload errors    |
+| Config key            | Environment variable                                          | Default                      | Description                       |
+| --------------------- | ------------------------------------------------------------- | ---------------------------- | --------------------------------- |
+| `enabled`             | `TRACE_TO_LANGFUSE`                                           | `false`                      | Enable tracing                    |
+| `public_key`          | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                            | Langfuse public key               |
+| `secret_key`          | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                            | Langfuse secret key               |
+| `base_url`            | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com` | Langfuse host                     |
+| `environment`         | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                            | Environment label                 |
+| `user_id`             | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found   | User id for all traces            |
+| `tags`                | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
+| `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
+| `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                            | Deterministic trace-id seed       |
+| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                   | OpenAI service pricing mode       |
+| `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                      | Add regional-processing surcharge |
+| `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
+| `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
+| `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                      | Fail the hook on upload errors    |
 
 ## Troubleshooting
 

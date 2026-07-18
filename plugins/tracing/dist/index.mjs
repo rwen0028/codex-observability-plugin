@@ -4275,6 +4275,13 @@ const ConfigSchema = object({
 	tags: array(string()).optional(),
 	metadata: record(string(), string()).optional(),
 	trace_seed: string().optional(),
+	pricing_mode: _enum([
+		"standard",
+		"batch",
+		"flex",
+		"priority"
+	]),
+	regional_processing: boolean(),
 	max_chars: number().int().positive(),
 	debug: boolean(),
 	fail_on_error: boolean()
@@ -4283,6 +4290,8 @@ const PartialConfigSchema = ConfigSchema.partial();
 const DEFAULTS = {
 	enabled: false,
 	base_url: "https://cloud.langfuse.com",
+	pricing_mode: "standard",
+	regional_processing: false,
 	max_chars: 2e4,
 	debug: false,
 	fail_on_error: false
@@ -4347,6 +4356,7 @@ async function readConfigFile(file) {
 			enabled: raw.enabled != null ? parseBoolean(raw.enabled) : void 0,
 			tags: raw.tags != null ? parseTags(raw.tags) : void 0,
 			metadata: raw.metadata != null ? parseMetadata(raw.metadata) : void 0,
+			regional_processing: raw.regional_processing != null ? parseBoolean(raw.regional_processing) : void 0,
 			max_chars: raw.max_chars != null ? parseInteger(raw.max_chars) : void 0,
 			debug: raw.debug != null ? parseBoolean(raw.debug) : void 0,
 			fail_on_error: raw.fail_on_error != null ? parseBoolean(raw.fail_on_error) : void 0
@@ -4393,6 +4403,8 @@ function readEnvConfig(env) {
 		tags: parseTags(env.LANGFUSE_CODEX_TAGS),
 		metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
 		trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
+		pricing_mode: env.LANGFUSE_CODEX_PRICING_MODE,
+		regional_processing: parseBoolean(env.LANGFUSE_CODEX_REGIONAL_PROCESSING),
 		max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
 		debug: parseBoolean(env.LANGFUSE_CODEX_DEBUG),
 		fail_on_error: parseBoolean(env.LANGFUSE_CODEX_FAIL_ON_ERROR)
@@ -46881,6 +46893,123 @@ function parseSession(lines) {
 }
 
 //#endregion
+//#region src/pricing.ts
+const PER_MILLION = 1e6;
+const LONG_CONTEXT_THRESHOLD = 272e3;
+/** Official OpenAI prices, USD per 1M tokens, published 2026-07-09. */
+const GPT_56_STANDARD_SHORT = {
+	sol: {
+		input: 5,
+		input_cached: .5,
+		input_cache_write: 6.25,
+		output: 30
+	},
+	terra: {
+		input: 2.5,
+		input_cached: .25,
+		input_cache_write: 3.125,
+		output: 15
+	},
+	luna: {
+		input: 1,
+		input_cached: .1,
+		input_cache_write: 1.25,
+		output: 6
+	}
+};
+function nonNegative(value) {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+/**
+* Codex reports inclusive input/output totals plus cached/reasoning subsets.
+* Langfuse requires arbitrary usage buckets to be mutually exclusive, so split
+* the inclusive totals before sending either usage or cost details.
+*/
+function normalizeUsage(usage) {
+	if (!usage) return void 0;
+	const inputTotal = nonNegative(usage.input_tokens);
+	const inputCached = nonNegative(usage.cached_input_tokens);
+	const inputCacheWrite = nonNegative(usage.cache_write_input_tokens ?? usage.cache_creation_input_tokens);
+	const outputTotal = nonNegative(usage.output_tokens);
+	const outputReasoning = nonNegative(usage.reasoning_output_tokens);
+	const details = {};
+	if (typeof usage.input_tokens === "number") details.input = Math.max(0, inputTotal - inputCached - inputCacheWrite);
+	if (typeof usage.cached_input_tokens === "number") details.input_cached = inputCached;
+	if (typeof usage.cache_write_input_tokens === "number" || typeof usage.cache_creation_input_tokens === "number") details.input_cache_write = inputCacheWrite;
+	if (typeof usage.output_tokens === "number") details.output = Math.max(0, outputTotal - outputReasoning);
+	if (typeof usage.reasoning_output_tokens === "number") details.output_reasoning = outputReasoning;
+	if (typeof usage.total_tokens === "number") details.total = nonNegative(usage.total_tokens);
+	return Object.keys(details).length > 0 ? details : void 0;
+}
+function modelTier(model) {
+	const normalized = model?.toLowerCase().replace(/^openai\//, "");
+	if (normalized === "gpt-5.6" || normalized === "gpt-5.6-sol") return "sol";
+	if (normalized === "gpt-5.6-terra") return "terra";
+	if (normalized === "gpt-5.6-luna") return "luna";
+}
+function pricingMode(turn, configured) {
+	const raw = turn.invocationParams?.service_tier ?? turn.invocationParams?.serviceTier;
+	if (typeof raw !== "string") return configured;
+	const normalized = raw.toLowerCase();
+	if (normalized === "priority" || normalized === "flex" || normalized === "batch") return normalized;
+	if (normalized === "default" || normalized === "standard" || normalized === "auto") return "standard";
+	return configured;
+}
+function modeMultiplier(mode) {
+	if (mode === "batch" || mode === "flex") return .5;
+	if (mode === "priority") return 2;
+	return 1;
+}
+/**
+* Calculate official-list-price cost details for GPT-5.6 generations.
+*
+* Priority does not support >272K long-context requests. If such a combination
+* appears, omit explicit cost instead of silently inventing a price.
+*/
+function calculateGpt56Cost(model, usage, turn, options) {
+	const tier = modelTier(model);
+	if (!tier || !usage) return void 0;
+	const contextTier = nonNegative(usage.input) + nonNegative(usage.input_cached) + nonNegative(usage.input_cache_write) > LONG_CONTEXT_THRESHOLD ? "long" : "short";
+	const mode = pricingMode(turn, options.mode);
+	if (mode === "priority" && contextTier === "long") return void 0;
+	const base = GPT_56_STANDARD_SHORT[tier];
+	const processingMultiplier = modeMultiplier(mode);
+	const regionalMultiplier = options.regionalProcessing ? 1.1 : 1;
+	const inputContextMultiplier = contextTier === "long" ? 2 : 1;
+	const outputContextMultiplier = contextTier === "long" ? 1.5 : 1;
+	const prices = {
+		input: base.input * inputContextMultiplier,
+		input_cached: base.input_cached * inputContextMultiplier,
+		input_cache_write: base.input_cache_write * inputContextMultiplier,
+		output: base.output * outputContextMultiplier,
+		output_reasoning: base.output * outputContextMultiplier
+	};
+	const costDetails = {};
+	for (const [usageType, units] of Object.entries(usage)) {
+		if (usageType === "total" || prices[usageType] == null) continue;
+		costDetails[usageType] = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
+	}
+	return {
+		costDetails,
+		mode,
+		contextTier,
+		regionalProcessing: options.regionalProcessing
+	};
+}
+function reasoningEffort(turn) {
+	const direct = turn.invocationParams?.effort ?? turn.invocationParams?.reasoning_effort;
+	if (typeof direct === "string") return direct;
+	const collaborationMode = turn.invocationParams?.collaboration_mode;
+	if (collaborationMode && typeof collaborationMode === "object") {
+		const settings = collaborationMode.settings;
+		if (settings && typeof settings === "object") {
+			const value = settings.reasoning_effort;
+			if (typeof value === "string") return value;
+		}
+	}
+}
+
+//#endregion
 //#region src/sidecar.ts
 /**
 * Per-rollout dedup ledger.
@@ -46914,7 +47043,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.1.0";
+const TRACE_PATCH_VERSION = "2.2.0";
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
@@ -46988,14 +47117,7 @@ async function seededTraceParent(config$1, sessionMeta, turnNumber) {
 	}
 }
 function toUsageDetails(usage) {
-	if (!usage) return void 0;
-	const details = {};
-	if (typeof usage.input_tokens === "number") details.input = usage.input_tokens;
-	if (typeof usage.output_tokens === "number") details.output = usage.output_tokens;
-	if (typeof usage.total_tokens === "number") details.total = usage.total_tokens;
-	if (typeof usage.cached_input_tokens === "number") details.cache_read_input_tokens = usage.cached_input_tokens;
-	if (typeof usage.reasoning_output_tokens === "number") details.reasoning_tokens = usage.reasoning_output_tokens;
-	return Object.keys(details).length > 0 ? details : void 0;
+	return normalizeUsage(usage);
 }
 /** Build a clip() that truncates long strings to `maxChars`. */
 function makeClip(maxChars) {
@@ -47055,12 +47177,28 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	let previousToolResults = void 0;
 	for (let i = 0; i < turn.steps.length; i++) {
 		const step = turn.steps[i];
+		const usageDetails = toUsageDetails(step.usage);
+		const pricing = calculateGpt56Cost(turn.model, usageDetails, turn, {
+			mode: ctx.config.pricing_mode,
+			regionalProcessing: ctx.config.regional_processing
+		});
+		const effort = reasoningEffort(turn);
 		const generation = startObservation(isSubagent ? "LLM Subagent" : "LLM", {
 			input: i === 0 ? turn.userInput != null ? clip(turn.userInput) : void 0 : previousToolResults,
 			output: buildGenerationOutput(step, clip),
 			model: turn.model,
-			usageDetails: toUsageDetails(step.usage),
-			metadata: { "codex.step_index": i }
+			usageDetails,
+			costDetails: pricing?.costDetails,
+			metadata: {
+				"codex.step_index": i,
+				...effort ? { "codex.reasoning_effort": effort } : {},
+				...pricing ? {
+					"cctrace.pricing_source": "openai-official-2026-07-09",
+					"cctrace.pricing_mode": pricing.mode,
+					"cctrace.pricing_context": pricing.contextTier,
+					"cctrace.pricing_regional": pricing.regionalProcessing
+				} : {}
+			}
 		}, {
 			asType: "generation",
 			startTime: new Date(step.startTime),
