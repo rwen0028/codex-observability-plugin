@@ -32,7 +32,7 @@ function calculate(
 }
 
 function totalCost(costDetails: Record<string, number>): number {
-  return Object.values(costDetails).reduce((sum, value) => sum + value, 0);
+  return costDetails.total;
 }
 
 describe("normalizeUsage", () => {
@@ -108,6 +108,7 @@ describe("GPT-5.6 official pricing", () => {
       input_cache_write: 0.0625,
       output: 6,
       output_reasoning: 6,
+      total: 12.1175,
     });
   });
 

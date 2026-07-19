@@ -131,6 +131,7 @@ describe("convertRollout", () => {
     expect(costs.input_cached).toBe(0);
     expect(costs.output).toBeCloseTo(0.00045, 12);
     expect(costs.output_reasoning).toBeCloseTo(0.00015, 12);
+    expect(costs.total).toBeCloseTo(0.0011, 12);
     expect(attr(generation!, "langfuse.observation.metadata.cctrace.pricing_source")).toBe(
       "openai-official-2026-07-09",
     );

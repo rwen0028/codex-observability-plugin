@@ -142,11 +142,17 @@ export function calculateGpt56Cost(
   };
 
   const costDetails: Record<string, number> = {};
+  let totalCost = 0;
   for (const [usageType, units] of Object.entries(usage)) {
     if (usageType === "total" || prices[usageType] == null) continue;
-    costDetails[usageType] =
+    const cost =
       (units * prices[usageType] * processingMultiplier * regionalMultiplier) / PER_MILLION;
+    costDetails[usageType] = cost;
+    totalCost += cost;
   }
+  // Langfuse documents this as optional, but older self-hosted releases only
+  // populate calculatedTotalCost when an explicit aggregate is ingested.
+  if (Object.keys(costDetails).length > 0) costDetails.total = totalCost;
 
   return {
     costDetails,

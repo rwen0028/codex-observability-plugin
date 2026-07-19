@@ -46985,10 +46985,14 @@ function calculateGpt56Cost(model, usage, turn, options) {
 		output_reasoning: base.output * outputContextMultiplier
 	};
 	const costDetails = {};
+	let totalCost = 0;
 	for (const [usageType, units] of Object.entries(usage)) {
 		if (usageType === "total" || prices[usageType] == null) continue;
-		costDetails[usageType] = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
+		const cost = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
+		costDetails[usageType] = cost;
+		totalCost += cost;
 	}
+	if (Object.keys(costDetails).length > 0) costDetails.total = totalCost;
 	return {
 		costDetails,
 		mode,
@@ -47043,7 +47047,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.2.1";
+const TRACE_PATCH_VERSION = "2.2.2";
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
