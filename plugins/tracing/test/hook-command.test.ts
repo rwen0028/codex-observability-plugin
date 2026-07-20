@@ -8,8 +8,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const hookConfigFile = path.join(repoRoot, "plugins/tracing/hooks/hooks.json");
-const bundleFile = path.join(repoRoot, "plugins/tracing/dist/index.mjs");
-const pluginManifestFile = path.join(repoRoot, "plugins/tracing/.codex-plugin/plugin.json");
 
 const tmpDirs: string[] = [];
 
@@ -24,20 +22,6 @@ function readHookCommand(): string {
     hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> };
   };
   return config.hooks.Stop[0].hooks[0].command;
-}
-
-function readPluginVersion(): string {
-  const manifest = JSON.parse(fs.readFileSync(pluginManifestFile, "utf-8")) as { version: string };
-  return manifest.version;
-}
-
-function stageInstalledPlugin(codexHome: string): void {
-  const installedBundle = path.join(
-    codexHome,
-    `plugins/cache/codex-observability-plugin/tracing/${readPluginVersion()}/dist/index.mjs`,
-  );
-  fs.mkdirSync(path.dirname(installedBundle), { recursive: true });
-  fs.copyFileSync(bundleFile, installedBundle);
 }
 
 function runShellCommand(
@@ -81,15 +65,15 @@ afterEach(() => {
 });
 
 describe("bundled Stop hook command", () => {
-  it("runs from an arbitrary session cwd via CODEX_HOME instead of a relative repo path", async () => {
+  it("runs from an arbitrary session cwd via the Codex-provided PLUGIN_ROOT", async () => {
     const codexHome = makeTempDir("lf-codex-home-");
     const sessionCwd = makeTempDir("lf-codex-cwd-");
-    stageInstalledPlugin(codexHome);
 
     const { code, stderr, stdout } = await runShellCommand(readHookCommand(), {
       cwd: sessionCwd,
       env: {
         ...process.env,
+        PLUGIN_ROOT: path.join(repoRoot, "plugins/tracing"),
         CODEX_HOME: codexHome,
         HOME: codexHome,
       },
@@ -105,12 +89,11 @@ describe("bundled Stop hook command", () => {
   });
 
   it("does not depend on the old marketplace-root relative path", () => {
-    expect(readHookCommand()).not.toContain("./plugins/tracing/dist/index.mjs");
+    expect(readHookCommand()).not.toContain("plugins/cache/");
   });
 
-  it("points at the installed cache path for this plugin version", () => {
-    expect(readHookCommand()).toContain(
-      `/plugins/cache/codex-observability-plugin/tracing/${readPluginVersion()}/dist/index.mjs`,
-    );
+  it("keeps an identical trusted command across plugin versions", () => {
+    expect(readHookCommand()).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
+    expect(readHookCommand()).not.toMatch(/\d+\.\d+\.\d+/);
   });
 });
