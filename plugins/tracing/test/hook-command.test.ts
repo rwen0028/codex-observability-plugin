@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { PLUGIN_VERSION } from "../src/version.js";
+
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const hookConfigFile = path.join(repoRoot, "plugins/tracing/hooks/hooks.json");
 
@@ -95,5 +97,20 @@ describe("bundled Stop hook command", () => {
   it("keeps an identical trusted command across plugin versions", () => {
     expect(readHookCommand()).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
     expect(readHookCommand()).not.toMatch(/\d+\.\d+\.\d+/);
+  });
+
+  it("keeps package, manifest, and trace metadata versions aligned", () => {
+    const packageVersion = (
+      JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf-8")) as {
+        version: string;
+      }
+    ).version;
+    const manifestVersion = (
+      JSON.parse(
+        fs.readFileSync(path.join(repoRoot, "plugins/tracing/.codex-plugin/plugin.json"), "utf-8"),
+      ) as { version: string }
+    ).version;
+    expect(PLUGIN_VERSION).toBe(packageVersion);
+    expect(manifestVersion).toBe(packageVersion);
   });
 });

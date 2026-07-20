@@ -16,6 +16,7 @@ import { calculateGpt56Cost, normalizeUsage, reasoningEffort } from "./pricing.j
 import { loadUploadedTurnIds, markTurnUploaded } from "./sidecar.js";
 import type { ModelStep, RolloutLine, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
 import { debugLog, toText, truncate } from "./utils.js";
+import { PLUGIN_VERSION } from "./version.js";
 
 /**
  * Stamped into every emitted trace so uploads self-identify which build
@@ -198,6 +199,7 @@ async function emitTurn(
         "codex.aborted": turn.aborted,
         "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
         "cctrace.patch": TRACE_PATCH_VERSION,
+        "cctrace.plugin_version": PLUGIN_VERSION,
       },
     },
     {

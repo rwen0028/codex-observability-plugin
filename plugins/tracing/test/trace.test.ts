@@ -14,6 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import type { Config } from "../src/config.js";
 import { convertRollout } from "../src/trace.js";
+import { PLUGIN_VERSION } from "../src/version.js";
 
 const exporter = new InMemorySpanExporter();
 let provider: NodeTracerProvider;
@@ -84,6 +85,9 @@ describe("convertRollout", () => {
 
     // Backdated to the turn's task_started timestamp.
     expect(startMs(root!)).toBe(Date.parse("2026-06-03T10:00:01.000Z"));
+    expect(attr(root!, "langfuse.observation.metadata.cctrace.plugin_version")).toBe(
+      PLUGIN_VERSION,
+    );
 
     // Two generations, both children of the root, named "LLM" (the model name
     // lives in the model attribute, not the observation name).

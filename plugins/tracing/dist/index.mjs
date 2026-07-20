@@ -630,9 +630,9 @@ const guid = /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9
 /** Returns a regex for validating an RFC 9562/4122 UUID.
 *
 * @param version Optionally specify a version 1-8. If no version is specified, all versions are supported. */
-const uuid = (version$1) => {
-	if (!version$1) return /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/;
-	return /* @__PURE__ */ new RegExp(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-${version$1}[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$`);
+const uuid = (version$2) => {
+	if (!version$2) return /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$/;
+	return /* @__PURE__ */ new RegExp(`^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-${version$2}[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})$`);
 };
 /** Practical email validation */
 const email = /^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
@@ -1068,7 +1068,7 @@ var Doc = class {
 
 //#endregion
 //#region ../../node_modules/.pnpm/zod@4.4.3/node_modules/zod/v4/core/versions.js
-const version = {
+const version$1 = {
 	major: 4,
 	minor: 4,
 	patch: 3
@@ -1081,7 +1081,7 @@ const $ZodType = /* @__PURE__ */ $constructor("$ZodType", (inst, def) => {
 	inst ?? (inst = {});
 	inst._zod.def = def;
 	inst._zod.bag = inst._zod.bag || {};
-	inst._zod.version = version;
+	inst._zod.version = version$1;
 	const checks = [...inst._zod.def.checks ?? []];
 	if (inst._zod.traits.has("$ZodCheck")) checks.unshift(inst);
 	for (const ch of checks) for (const fn of ch._zod.onattach) fn(inst);
@@ -5397,10 +5397,10 @@ var init_ProxyTracer = __esmMin((() => {
 	init_NoopTracer();
 	NOOP_TRACER = new NoopTracer();
 	ProxyTracer = class {
-		constructor(provider, name, version$1, options) {
+		constructor(provider, name, version$2, options) {
 			this._provider = provider;
 			this.name = name;
-			this.version = version$1;
+			this.version = version$2;
 			this.options = options;
 		}
 		startSpan(name, options, context$1) {
@@ -5447,9 +5447,9 @@ var init_ProxyTracerProvider = __esmMin((() => {
 		/**
 		* Get a {@link ProxyTracer}
 		*/
-		getTracer(name, version$1, options) {
+		getTracer(name, version$2, options) {
 			var _a$3;
-			return (_a$3 = this.getDelegateTracer(name, version$1, options)) !== null && _a$3 !== void 0 ? _a$3 : new ProxyTracer(this, name, version$1, options);
+			return (_a$3 = this.getDelegateTracer(name, version$2, options)) !== null && _a$3 !== void 0 ? _a$3 : new ProxyTracer(this, name, version$2, options);
 		}
 		getDelegate() {
 			var _a$3;
@@ -5461,9 +5461,9 @@ var init_ProxyTracerProvider = __esmMin((() => {
 		setDelegate(delegate) {
 			this._delegate = delegate;
 		}
-		getDelegateTracer(name, version$1, options) {
+		getDelegateTracer(name, version$2, options) {
 			var _a$3;
-			return (_a$3 = this._delegate) === null || _a$3 === void 0 ? void 0 : _a$3.getTracer(name, version$1, options);
+			return (_a$3 = this._delegate) === null || _a$3 === void 0 ? void 0 : _a$3.getTracer(name, version$2, options);
 		}
 	};
 }));
@@ -5709,8 +5709,8 @@ var init_metrics = __esmMin((() => {
 		/**
 		* Returns a meter from the global meter provider.
 		*/
-		getMeter(name, version$1, options) {
-			return this.getMeterProvider().getMeter(name, version$1, options);
+		getMeter(name, version$2, options) {
+			return this.getMeterProvider().getMeter(name, version$2, options);
 		}
 		/** Remove the global meter provider */
 		disable() {
@@ -5912,8 +5912,8 @@ var init_trace$1 = __esmMin((() => {
 		/**
 		* Returns a tracer from the global tracer provider.
 		*/
-		getTracer(name, version$1) {
-			return this.getTracerProvider().getTracer(name, version$1);
+		getTracer(name, version$2) {
+			return this.getTracerProvider().getTracer(name, version$2);
 		}
 		/** Remove the global tracer provider */
 		disable() {
@@ -8764,12 +8764,12 @@ var DatasetItems = class {
 	}
 	async __list(request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { datasetName, sourceTraceId, sourceObservationId, version: version$1, page, limit } = request;
+		const { datasetName, sourceTraceId, sourceObservationId, version: version$2, page, limit } = request;
 		const _queryParams = {};
 		if (datasetName != null) _queryParams["datasetName"] = datasetName;
 		if (sourceTraceId != null) _queryParams["sourceTraceId"] = sourceTraceId;
 		if (sourceObservationId != null) _queryParams["sourceObservationId"] = sourceObservationId;
-		if (version$1 != null) _queryParams["version"] = version$1;
+		if (version$2 != null) _queryParams["version"] = version$2;
 		if (page != null) _queryParams["page"] = page.toString();
 		if (limit != null) _queryParams["limit"] = limit.toString();
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
@@ -9883,7 +9883,7 @@ var ObservationsV1 = class {
 	}
 	async __getMany(request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { page, limit, name, userId, type: type_, traceId, level, parentObservationId, environment, fromStartTime, toStartTime, version: version$1, filter } = request;
+		const { page, limit, name, userId, type: type_, traceId, level, parentObservationId, environment, fromStartTime, toStartTime, version: version$2, filter } = request;
 		const _queryParams = {};
 		if (page != null) _queryParams["page"] = page.toString();
 		if (limit != null) _queryParams["limit"] = limit.toString();
@@ -9897,7 +9897,7 @@ var ObservationsV1 = class {
 		else _queryParams["environment"] = environment;
 		if (fromStartTime != null) _queryParams["fromStartTime"] = fromStartTime;
 		if (toStartTime != null) _queryParams["toStartTime"] = toStartTime;
-		if (version$1 != null) _queryParams["version"] = version$1;
+		if (version$2 != null) _queryParams["version"] = version$2;
 		if (filter != null) _queryParams["filter"] = filter;
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
 			Authorization: await this._getAuthorizationHeader(),
@@ -11102,7 +11102,7 @@ var Observations = class {
 	}
 	async __getMany(request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { fields, expandMetadata, limit, cursor, parseIoAsJson, name, userId, type: type_, traceId, level, parentObservationId, environment, fromStartTime, toStartTime, version: version$1, filter } = request;
+		const { fields, expandMetadata, limit, cursor, parseIoAsJson, name, userId, type: type_, traceId, level, parentObservationId, environment, fromStartTime, toStartTime, version: version$2, filter } = request;
 		const _queryParams = {};
 		if (fields != null) _queryParams["fields"] = fields;
 		if (expandMetadata != null) _queryParams["expandMetadata"] = expandMetadata;
@@ -11119,7 +11119,7 @@ var Observations = class {
 		else _queryParams["environment"] = environment;
 		if (fromStartTime != null) _queryParams["fromStartTime"] = fromStartTime;
 		if (toStartTime != null) _queryParams["toStartTime"] = toStartTime;
-		if (version$1 != null) _queryParams["version"] = version$1;
+		if (version$2 != null) _queryParams["version"] = version$2;
 		if (filter != null) _queryParams["filter"] = filter;
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
 			Authorization: await this._getAuthorizationHeader(),
@@ -12363,10 +12363,10 @@ var PromptVersion = class {
 	*         newLabels: ["newLabels", "newLabels"]
 	*     })
 	*/
-	update(name, version$1, request, requestOptions) {
-		return HttpResponsePromise.fromPromise(this.__update(name, version$1, request, requestOptions));
+	update(name, version$2, request, requestOptions) {
+		return HttpResponsePromise.fromPromise(this.__update(name, version$2, request, requestOptions));
 	}
-	async __update(name, version$1, request, requestOptions) {
+	async __update(name, version$2, request, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
 			Authorization: await this._getAuthorizationHeader(),
@@ -12375,7 +12375,7 @@ var PromptVersion = class {
 			"X-Langfuse-Public-Key": (_g = requestOptions == null ? void 0 : requestOptions.xLangfusePublicKey) != null ? _g : (_f = this._options) == null ? void 0 : _f.xLangfusePublicKey
 		}), requestOptions == null ? void 0 : requestOptions.headers);
 		const _response = await fetcher({
-			url: url_exports.join((_h = await Supplier.get(this._options.baseUrl)) != null ? _h : await Supplier.get(this._options.environment), `/api/public/v2/prompts/${encodeURIComponent(name)}/versions/${encodeURIComponent(version$1)}`),
+			url: url_exports.join((_h = await Supplier.get(this._options.baseUrl)) != null ? _h : await Supplier.get(this._options.environment), `/api/public/v2/prompts/${encodeURIComponent(name)}/versions/${encodeURIComponent(version$2)}`),
 			method: "PATCH",
 			headers: _headers,
 			contentType: "application/json",
@@ -12450,9 +12450,9 @@ var Prompts = class {
 	}
 	async __get(promptName, request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { version: version$1, label, resolve } = request;
+		const { version: version$2, label, resolve } = request;
 		const _queryParams = {};
-		if (version$1 != null) _queryParams["version"] = version$1.toString();
+		if (version$2 != null) _queryParams["version"] = version$2.toString();
 		if (label != null) _queryParams["label"] = label;
 		if (resolve != null) _queryParams["resolve"] = resolve.toString();
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
@@ -12682,10 +12682,10 @@ var Prompts = class {
 	}
 	async __delete(promptName, request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { label, version: version$1 } = request;
+		const { label, version: version$2 } = request;
 		const _queryParams = {};
 		if (label != null) _queryParams["label"] = label;
-		if (version$1 != null) _queryParams["version"] = version$1.toString();
+		if (version$2 != null) _queryParams["version"] = version$2.toString();
 		let _headers = mergeHeaders$1((_a2 = this._options) == null ? void 0 : _a2.headers, mergeOnlyDefinedHeaders({
 			Authorization: await this._getAuthorizationHeader(),
 			"X-Langfuse-Sdk-Name": (_c = requestOptions == null ? void 0 : requestOptions.xLangfuseSdkName) != null ? _c : (_b = this._options) == null ? void 0 : _b.xLangfuseSdkName,
@@ -13996,7 +13996,7 @@ var Trace = class {
 	}
 	async __list(request = {}, requestOptions) {
 		var _a2, _b, _c, _d, _e, _f, _g, _h;
-		const { page, limit, userId, name, sessionId, fromTimestamp, toTimestamp, orderBy, tags, version: version$1, release, environment, fields, filter } = request;
+		const { page, limit, userId, name, sessionId, fromTimestamp, toTimestamp, orderBy, tags, version: version$2, release, environment, fields, filter } = request;
 		const _queryParams = {};
 		if (page != null) _queryParams["page"] = page.toString();
 		if (limit != null) _queryParams["limit"] = limit.toString();
@@ -14008,7 +14008,7 @@ var Trace = class {
 		if (orderBy != null) _queryParams["orderBy"] = orderBy;
 		if (tags != null) if (Array.isArray(tags)) _queryParams["tags"] = tags.map((item) => item);
 		else _queryParams["tags"] = tags;
-		if (version$1 != null) _queryParams["version"] = version$1;
+		if (version$2 != null) _queryParams["version"] = version$2;
 		if (release != null) _queryParams["release"] = release;
 		if (environment != null) if (Array.isArray(environment)) _queryParams["environment"] = environment.map((item) => item);
 		else _queryParams["environment"] = environment;
@@ -15281,7 +15281,7 @@ function propagateAttributes(params, fn) {
 	let context$1 = context.active();
 	const span = trace.getActiveSpan();
 	const asBaggage = (_a2 = params.asBaggage) != null ? _a2 : false;
-	const { userId, sessionId, metadata, version: version$1, tags, traceName, _internalExperiment } = params;
+	const { userId, sessionId, metadata, version: version$2, tags, traceName, _internalExperiment } = params;
 	if (userId) {
 		if (isValidPropagatedString({
 			value: userId,
@@ -15306,13 +15306,13 @@ function propagateAttributes(params, fn) {
 			asBaggage
 		});
 	}
-	if (version$1) {
+	if (version$2) {
 		if (isValidPropagatedString({
-			value: version$1,
+			value: version$2,
 			attributeName: "version"
 		})) context$1 = setPropagatedAttribute({
 			key: "version",
-			value: version$1,
+			value: version$2,
 			context: context$1,
 			span,
 			asBaggage
@@ -15388,10 +15388,10 @@ function getPropagatedAttributesFromContext(context$1) {
 		const spanKey = getSpanKeyForPropagatedKey("sessionId");
 		propagatedAttributes[spanKey] = sessionId;
 	}
-	const version$1 = context$1.getValue(LangfuseOtelContextKeys["version"]);
-	if (version$1 && typeof version$1 === "string") {
+	const version$2 = context$1.getValue(LangfuseOtelContextKeys["version"]);
+	if (version$2 && typeof version$2 === "string") {
 		const spanKey = getSpanKeyForPropagatedKey("version");
-		propagatedAttributes[spanKey] = version$1;
+		propagatedAttributes[spanKey] = version$2;
 	}
 	const traceName = context$1.getValue(LangfuseOtelContextKeys["traceName"]);
 	if (traceName && typeof traceName === "string") {
@@ -36902,13 +36902,13 @@ var require_internal$2 = /* @__PURE__ */ __commonJSMin(((exports) => {
 	function createResourceMap(logRecords) {
 		const resourceMap = /* @__PURE__ */ new Map();
 		for (const record$1 of logRecords) {
-			const { resource, instrumentationScope: { name, version: version$1 = "", schemaUrl = "" } } = record$1;
+			const { resource, instrumentationScope: { name, version: version$2 = "", schemaUrl = "" } } = record$1;
 			let ismMap = resourceMap.get(resource);
 			if (!ismMap) {
 				ismMap = /* @__PURE__ */ new Map();
 				resourceMap.set(resource, ismMap);
 			}
-			const ismKey = `${name}@${version$1}:${schemaUrl}`;
+			const ismKey = `${name}@${version$2}:${schemaUrl}`;
 			let records = ismMap.get(ismKey);
 			if (!records) {
 				records = [];
@@ -41520,14 +41520,14 @@ var require_MeterProvider = /* @__PURE__ */ __commonJSMin(((exports) => {
 		/**
 		* Get a meter with the configuration of the MeterProvider.
 		*/
-		getMeter(name, version$1 = "", options = {}) {
+		getMeter(name, version$2 = "", options = {}) {
 			if (this._shutdown) {
 				api_1.diag.warn("A shutdown MeterProvider cannot provide a Meter");
 				return (0, api_1.createNoopMeter)();
 			}
 			return this._sharedState.getMeterSharedState({
 				name,
-				version: version$1,
+				version: version$2,
 				schemaUrl: options.schemaUrl
 			}).meter;
 		}
@@ -44859,11 +44859,11 @@ var require_BasicTracerProvider = /* @__PURE__ */ __commonJSMin(((exports) => {
 			if (config$1.spanProcessors?.length) spanProcessors.push(...config$1.spanProcessors);
 			this._activeSpanProcessor = new MultiSpanProcessor_1.MultiSpanProcessor(spanProcessors);
 		}
-		getTracer(name, version$1, options) {
-			const key = `${name}@${version$1 || ""}:${options?.schemaUrl || ""}`;
+		getTracer(name, version$2, options) {
+			const key = `${name}@${version$2 || ""}:${options?.schemaUrl || ""}`;
 			if (!this._tracers.has(key)) this._tracers.set(key, new Tracer_1.Tracer({
 				name,
-				version: version$1,
+				version: version$2,
 				schemaUrl: options?.schemaUrl
 			}, this._config, this._resource, this._activeSpanProcessor));
 			return this._tracers.get(key);
@@ -46118,12 +46118,12 @@ function createTraceAttributes({ input, output } = {}) {
 	return Object.fromEntries(Object.entries(attributes).filter(([_, v]) => v != null));
 }
 function createObservationAttributes(type, attributes) {
-	const { metadata, input, output, level, statusMessage, version: version$1, completionStartTime, model, modelParameters, usageDetails, costDetails, prompt } = attributes;
+	const { metadata, input, output, level, statusMessage, version: version$2, completionStartTime, model, modelParameters, usageDetails, costDetails, prompt } = attributes;
 	let otelAttributes = {
 		[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: type,
 		[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: level,
 		[LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]: statusMessage,
-		[LangfuseOtelSpanAttributes.VERSION]: version$1,
+		[LangfuseOtelSpanAttributes.VERSION]: version$2,
 		[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: _serialize(input),
 		[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: _serialize(output),
 		[LangfuseOtelSpanAttributes.OBSERVATION_MODEL]: model,
@@ -47040,6 +47040,15 @@ async function markTurnUploaded(rolloutFile, turnId) {
 }
 
 //#endregion
+//#region ../../package.json
+var version = "0.2.4";
+
+//#endregion
+//#region src/version.ts
+/** Plugin package version embedded into every Langfuse trace. */
+const PLUGIN_VERSION = version;
+
+//#endregion
 //#region src/trace.ts
 init_esm$2();
 /**
@@ -47171,7 +47180,8 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			"codex.cli_version": sessionMeta.cliVersion,
 			"codex.aborted": turn.aborted,
 			"codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
-			"cctrace.patch": TRACE_PATCH_VERSION
+			"cctrace.patch": TRACE_PATCH_VERSION,
+			"cctrace.plugin_version": PLUGIN_VERSION
 		}
 	}, {
 		asType: "agent",
