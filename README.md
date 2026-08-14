@@ -12,7 +12,7 @@ After each Codex turn, the plugin reads the session's rollout transcript and upl
 - **Generations** — one per model response within the turn, named `LLM` (or `LLM Subagent` inside subagent threads), with the model recorded on the observation plus reasoning, assistant text, the tool calls it requested, and token usage.
 - **Tool calls** — shell commands, `apply_patch`, `spawn_agent`, MCP tools, web searches, etc., each with its input, output, and error status. MCP calls are named `server.tool`, and failed commands are flagged as errors.
 - **Subagents** — subagent threads are resolved from their own rollout files and nested under the spawning turn as `Codex Subagent Turn`.
-- **Sessions** — all turns from one Codex session are grouped via the Codex thread id, so you can replay the whole session in Langfuse's [Sessions](https://langfuse.com/docs/observability/features/sessions) view.
+- **Sessions** — turns are grouped by Codex thread id by default; a validated CloseClaw support context can instead supply a stable business session id.
 
 Interrupted turns (where you cancel mid-response) are still uploaded and flagged as interrupted.
 
@@ -85,22 +85,23 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 
 ## Environment variables
 
-| Variable                                                      | Required | Default                      | Description                                                          |
-| ------------------------------------------------------------- | -------- | ---------------------------- | -------------------------------------------------------------------- |
-| `TRACE_TO_LANGFUSE`                                           | Yes      | `false`                      | Set to `"true"` to enable tracing                                    |
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | Yes      | —                            | Langfuse public key (`pk-lf-...`)                                    |
-| `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | Yes      | —                            | Langfuse secret key (`sk-lf-...`)                                    |
-| `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | No       | `https://cloud.langfuse.com` | Langfuse host / data region                                          |
-| `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | No       | —                            | Environment label for the traces (e.g. `production`)                 |
-| `LANGFUSE_CODEX_USER_ID`                                      | No       | Codex auth email, if found   | Attach a user id to all traces                                       |
-| `LANGFUSE_CODEX_TAGS`                                         | No       | —                            | Tags for all traces (JSON array or comma-separated)                  |
-| `LANGFUSE_CODEX_METADATA`                                     | No       | —                            | JSON object of metadata to attach to all traces                      |
-| `LANGFUSE_CODEX_TRACE_SEED`                                   | No       | —                            | Derive deterministic trace ids ([details](#deterministic-trace-ids)) |
-| `LANGFUSE_CODEX_PRICING_MODE`                                 | No       | `standard`                   | OpenAI service mode: `standard`, `batch`, `flex`, or `priority`      |
-| `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | No       | `false`                      | Add OpenAI's 10% regional-processing surcharge                       |
-| `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                      | Truncate inputs/outputs longer than this many characters             |
-| `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                      | Set to `"true"` for verbose logging to stderr                        |
-| `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                      | Set to `"true"` to make hook upload errors fail the hook             |
+| Variable                                                      | Required | Default                               | Description                                                                     |
+| ------------------------------------------------------------- | -------- | ------------------------------------- | ------------------------------------------------------------------------------- |
+| `TRACE_TO_LANGFUSE`                                           | Yes      | `false`                               | Set to `"true"` to enable tracing                                               |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | Yes      | —                                     | Langfuse public key (`pk-lf-...`)                                               |
+| `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | Yes      | —                                     | Langfuse secret key (`sk-lf-...`)                                               |
+| `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | No       | `https://cloud.langfuse.com`          | Langfuse host / data region                                                     |
+| `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | No       | —                                     | Environment label for the traces (e.g. `production`)                            |
+| `LANGFUSE_CODEX_USER_ID`                                      | No       | Codex auth email, if found            | Attach a user id to all traces                                                  |
+| `LANGFUSE_CODEX_TAGS`                                         | No       | —                                     | Tags for all traces (JSON array or comma-separated)                             |
+| `LANGFUSE_CODEX_METADATA`                                     | No       | —                                     | JSON object of metadata to attach to all traces                                 |
+| `LANGFUSE_CODEX_TRACE_SEED`                                   | No       | —                                     | Derive deterministic trace ids ([details](#deterministic-trace-ids))            |
+| `LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR`                          | No       | `$CODEX_HOME/cctrace/support-context` | Per-thread/turn CloseClaw context root ([details](#closeclaw-per-turn-context)) |
+| `LANGFUSE_CODEX_PRICING_MODE`                                 | No       | `standard`                            | OpenAI service mode: `standard`, `batch`, `flex`, or `priority`                 |
+| `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | No       | `false`                               | Add OpenAI's 10% regional-processing surcharge                                  |
+| `LANGFUSE_CODEX_MAX_CHARS`                                    | No       | `20000`                               | Truncate inputs/outputs longer than this many characters                        |
+| `LANGFUSE_CODEX_DEBUG`                                        | No       | `false`                               | Set to `"true"` for verbose logging to stderr                                   |
+| `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | No       | `false`                               | Set to `"true"` to make hook upload errors fail the hook                        |
 
 ### Data regions
 
@@ -182,24 +183,63 @@ LANGFUSE_CODEX_TRACE_SEED="$SEED" codex exec "your prompt"
 
 The same works from JavaScript with the Langfuse SDK: `await createTraceId(`${seed}:1`)` (from `@langfuse/tracing`) returns the identical id.
 
+## CloseClaw per-turn context
+
+A shared Codex App Server cannot use process-wide `user_id`, `tags`, `metadata`, or
+`trace_seed` values to distinguish multiple support customers. CloseClaw can write a
+strict per-turn context file before the Codex `Stop` hook runs:
+
+```text
+<support_context_dir>/<codex-thread-id>/<codex-turn-id>.json
+```
+
+```json
+{
+  "version": 1,
+  "thread_id": "codex-thread-id",
+  "turn_id": "codex-turn-id",
+  "session_id": "public-support-session-id",
+  "user_id": "anonymous-public-user-id",
+  "run_id": "public-support-run-id",
+  "environment": "test",
+  "channel": "portal",
+  "trace_seed": "stable-trace-seed",
+  "prompt_version": "v1",
+  "created_at": "2026-08-14T09:00:00.000Z"
+}
+```
+
+The reader accepts only version 1, identifier-only values, a matching thread/turn path,
+regular files no larger than 16 KiB, and no extra fields. Valid context overrides the
+Langfuse `sessionId`, `userId`, and trace seed for that turn; it adds the run id,
+environment, channel, prompt version, and Codex identifiers as trace metadata. It also
+adds `closeclaw-support`, `environment:<value>`, and `channel:<value>` tags.
+
+Missing or invalid files fail open and leave normal Codex tracing unchanged. Sidecars
+must not contain names, email addresses, messages, balances, credentials, or API keys.
+The default root is `$CODEX_HOME/cctrace/support-context` (or
+`~/.codex/cctrace/support-context`); override it with
+`LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR` or `support_context_dir` in JSON config.
+
 ## JSON config reference
 
-| Config key            | Environment variable                                          | Default                      | Description                       |
-| --------------------- | ------------------------------------------------------------- | ---------------------------- | --------------------------------- |
-| `enabled`             | `TRACE_TO_LANGFUSE`                                           | `false`                      | Enable tracing                    |
-| `public_key`          | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                            | Langfuse public key               |
-| `secret_key`          | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                            | Langfuse secret key               |
-| `base_url`            | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com` | Langfuse host                     |
-| `environment`         | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                            | Environment label                 |
-| `user_id`             | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found   | User id for all traces            |
-| `tags`                | `LANGFUSE_CODEX_TAGS`                                         | —                            | Tags for all traces               |
-| `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                            | Metadata object for all traces    |
-| `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                            | Deterministic trace-id seed       |
-| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                   | OpenAI service pricing mode       |
-| `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                      | Add regional-processing surcharge |
-| `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                      | Input/output truncation threshold |
-| `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                      | Verbose logging                   |
-| `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                      | Fail the hook on upload errors    |
+| Config key            | Environment variable                                          | Default                               | Description                       |
+| --------------------- | ------------------------------------------------------------- | ------------------------------------- | --------------------------------- |
+| `enabled`             | `TRACE_TO_LANGFUSE`                                           | `false`                               | Enable tracing                    |
+| `public_key`          | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                                     | Langfuse public key               |
+| `secret_key`          | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                                     | Langfuse secret key               |
+| `base_url`            | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com`          | Langfuse host                     |
+| `environment`         | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                                     | Environment label                 |
+| `user_id`             | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found            | User id for all traces            |
+| `tags`                | `LANGFUSE_CODEX_TAGS`                                         | —                                     | Tags for all traces               |
+| `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                                     | Metadata object for all traces    |
+| `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                                     | Deterministic trace-id seed       |
+| `support_context_dir` | `LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR`                          | `$CODEX_HOME/cctrace/support-context` | CloseClaw per-turn context root   |
+| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                            | OpenAI service pricing mode       |
+| `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                               | Add regional-processing surcharge |
+| `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                               | Input/output truncation threshold |
+| `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                               | Verbose logging                   |
+| `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                               | Fail the hook on upload errors    |
 
 ## Troubleshooting
 

@@ -34,13 +34,33 @@ const emptyHome = () => makeTmpHome();
 
 describe("getConfig", () => {
   it("defaults to disabled with EU cloud base URL", async () => {
-    const config = await getConfig({ home: emptyHome(), cwd: emptyHome(), env: {} });
+    const home = emptyHome();
+    const config = await getConfig({ home, cwd: emptyHome(), env: {} });
     expect(config.enabled).toBe(false);
     expect(config.base_url).toBe("https://cloud.langfuse.com");
     expect(config.max_chars).toBe(20_000);
     expect(config.fail_on_error).toBe(false);
     expect(config.pricing_mode).toBe("standard");
     expect(config.regional_processing).toBe(false);
+    expect(config.support_context_dir).toBe(path.join(home, ".codex/cctrace/support-context"));
+  });
+
+  it("resolves the support context directory from CODEX_HOME or an explicit override", async () => {
+    const codexHome = emptyHome();
+    const fromCodexHome = await getConfig({
+      home: emptyHome(),
+      cwd: emptyHome(),
+      env: { CODEX_HOME: codexHome },
+    });
+    expect(fromCodexHome.support_context_dir).toBe(path.join(codexHome, "cctrace/support-context"));
+
+    const explicit = path.join(emptyHome(), "support-sidecars");
+    const overridden = await getConfig({
+      home: emptyHome(),
+      cwd: emptyHome(),
+      env: { LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR: explicit },
+    });
+    expect(overridden.support_context_dir).toBe(explicit);
   });
 
   it("reads credentials and enable flag from environment variables", async () => {

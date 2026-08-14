@@ -29,6 +29,7 @@ const baseConfig: Config = {
   regional_processing: false,
   debug: false,
   fail_on_error: false,
+  support_context_dir: path.join(os.tmpdir(), "missing-cctrace-support-context"),
 };
 
 const fixturesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/sessions");
@@ -275,6 +276,63 @@ describe("convertRollout", () => {
     const root = exporter.getFinishedSpans().find((s) => s.name === "Codex Turn");
     expect(root, "an aborted turn with reasoning must still be traced").toBeDefined();
     expect(attr(root!, "langfuse.observation.level")).toBe("WARNING"); // marked interrupted
+  });
+});
+
+describe("CloseClaw support context", () => {
+  it("maps per-turn sidecar identifiers to Langfuse trace attributes", async () => {
+    const dir = stageFixtures();
+    const supportRoot = fs.mkdtempSync(path.join(os.tmpdir(), "lf-codex-support-"));
+    const contextDir = path.join(supportRoot, "sess-basic");
+    fs.mkdirSync(contextDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(contextDir, "turn-1.json"),
+      JSON.stringify({
+        version: 1,
+        thread_id: "sess-basic",
+        turn_id: "turn-1",
+        session_id: "support-session-1",
+        user_id: "support-user-1",
+        run_id: "support-run-1",
+        environment: "test",
+        channel: "portal",
+        trace_seed: "support-seed-1",
+        prompt_version: "v1",
+        created_at: "2026-08-14T09:00:00.000Z",
+      }),
+      { mode: 0o600 },
+    );
+
+    await convertRollout(path.join(dir, "rollout-basic-main.jsonl"), {
+      config: {
+        ...baseConfig,
+        support_context_dir: supportRoot,
+        user_id: "fallback-user",
+        trace_seed: "fallback-seed",
+        tags: ["configured"],
+        metadata: { configured: "true" },
+      },
+    });
+
+    const root = exporter.getFinishedSpans().find((span) => span.name === "Codex Turn")!;
+    expect(root.spanContext().traceId).toBe(seededTraceId("support-seed-1:1"));
+    expect(attr(root, "session.id")).toBe("support-session-1");
+    expect(attr(root, "user.id")).toBe("support-user-1");
+    expect(root.attributes["langfuse.trace.tags"]).toEqual([
+      "configured",
+      "closeclaw-support",
+      "environment:test",
+      "channel:portal",
+    ]);
+    const traceMetadata = (key: string): string => attr(root, `langfuse.trace.metadata.${key}`);
+    expect(traceMetadata("configured")).toBe("true");
+    expect(traceMetadata("cctrace.context_source")).toBe("closeclaw-support-v1");
+    expect(traceMetadata("closeclaw.run_id")).toBe("support-run-1");
+    expect(traceMetadata("closeclaw.environment")).toBe("test");
+    expect(traceMetadata("closeclaw.channel")).toBe("portal");
+    expect(traceMetadata("closeclaw.prompt_version")).toBe("v1");
+    expect(traceMetadata("codex.thread_id")).toBe("sess-basic");
+    expect(traceMetadata("codex.turn_id")).toBe("turn-1");
   });
 });
 

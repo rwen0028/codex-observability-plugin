@@ -7,13 +7,20 @@ import {
   propagateAttributes,
   startObservation,
   type LangfuseObservation,
+  type PropagateAttributesParams,
 } from "@langfuse/tracing";
-import { TraceFlags, type SpanContext } from "@opentelemetry/api";
+import {
+  context as otelContext,
+  trace as otelTrace,
+  TraceFlags,
+  type SpanContext,
+} from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
 import { parseSession } from "./parse.js";
 import { calculateGpt56Cost, normalizeUsage, reasoningEffort } from "./pricing.js";
 import { loadUploadedTurnIds, markTurnUploaded } from "./sidecar.js";
+import { loadSupportTraceContext } from "./support-context.js";
 import type { ModelStep, RolloutLine, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
 import { debugLog, toText, truncate } from "./utils.js";
 import { PLUGIN_VERSION } from "./version.js";
@@ -23,7 +30,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.2.2";
+const TRACE_PATCH_VERSION = "2.3.0";
 
 async function loadSession(file: string): Promise<RolloutLine[]> {
   const data = await fs.readFile(file, "utf-8");
@@ -99,12 +106,14 @@ async function seededTraceParent(
   config: Config,
   sessionMeta: SessionMeta,
   turnNumber: number,
+  supportTraceSeed?: string,
 ): Promise<SpanContext | undefined> {
-  if (!config.trace_seed) return undefined;
+  const traceSeed = supportTraceSeed ?? config.trace_seed;
+  if (!traceSeed) return undefined;
   try {
     const seed = sessionMeta.isSubagentThread
-      ? `${config.trace_seed}:${sessionMeta.sessionId}:${turnNumber}`
-      : `${config.trace_seed}:${turnNumber}`;
+      ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
+      : `${traceSeed}:${turnNumber}`;
     return {
       traceId: await createTraceId(seed),
       spanId: SEED_PARENT_SPAN_ID,
@@ -175,6 +184,8 @@ async function emitTurn(
     parentObservation?: LangfuseObservation;
     /** Pre-derived trace id for top-level turns (see seededTraceParent). */
     seededParent?: SpanContext;
+    /** Trace-level identity applied after the root observation exists. */
+    traceAttributes?: PropagateAttributesParams;
   },
 ): Promise<void> {
   const clip = makeClip(ctx.config.max_chars);
@@ -208,6 +219,15 @@ async function emitTurn(
       parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent,
     },
   );
+
+  // propagateAttributes updates an existing active span. Applying it before
+  // the root exists stores only context values, so user/session metadata would
+  // never reach the exported trace. Make the root active for this update.
+  if (ctx.traceAttributes) {
+    otelContext.with(otelTrace.setSpan(otelContext.active(), root.otelSpan), () =>
+      propagateAttributes(ctx.traceAttributes!, () => undefined),
+    );
+  }
 
   let previousToolResults: unknown = undefined;
 
@@ -356,24 +376,60 @@ export async function convertRollout(
 
     // Turn numbering stays 1-based over the full rollout (including turns
     // skipped by dedup above) so the derived id is stable across hook runs.
-    const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
-
-    await propagateAttributes(
-      {
-        sessionId: sessionMeta.sessionId,
-        traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
-        ...(options.config.user_id ? { userId: options.config.user_id } : {}),
-        ...(options.config.tags ? { tags: options.config.tags } : {}),
-        ...(options.config.metadata ? { metadata: options.config.metadata } : {}),
-      },
-      async () => {
-        await emitTurn(turn, sessionMeta, {
-          config: options.config,
-          rolloutFile,
-          seededParent,
-        });
-      },
+    const supportContext = turn.turnId
+      ? await loadSupportTraceContext(
+          options.config.support_context_dir,
+          sessionMeta.sessionId,
+          turn.turnId,
+        )
+      : undefined;
+    const seededParent = await seededTraceParent(
+      options.config,
+      sessionMeta,
+      turnIndex + 1,
+      supportContext?.trace_seed,
     );
+    const userId = supportContext?.user_id ?? options.config.user_id;
+    const tags = [
+      ...(options.config.tags ?? []),
+      ...(supportContext
+        ? [
+            "closeclaw-support",
+            `environment:${supportContext.environment}`,
+            `channel:${supportContext.channel}`,
+          ]
+        : []),
+    ].filter((value, index, values) => values.indexOf(value) === index);
+    const metadata: Record<string, string> = {
+      ...(options.config.metadata ?? {}),
+      ...(supportContext
+        ? {
+            "cctrace.context_source": "closeclaw-support-v1",
+            "closeclaw.run_id": supportContext.run_id,
+            "closeclaw.environment": supportContext.environment,
+            "closeclaw.channel": supportContext.channel,
+            "codex.thread_id": sessionMeta.sessionId,
+            ...(turn.turnId ? { "codex.turn_id": turn.turnId } : {}),
+            ...(supportContext.prompt_version
+              ? { "closeclaw.prompt_version": supportContext.prompt_version }
+              : {}),
+          }
+        : {}),
+    };
+
+    const traceAttributes: PropagateAttributesParams = {
+      sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
+      traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
+      ...(userId ? { userId } : {}),
+      ...(tags.length > 0 ? { tags } : {}),
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+    };
+    await emitTurn(turn, sessionMeta, {
+      config: options.config,
+      rolloutFile,
+      seededParent,
+      traceAttributes,
+    });
 
     // Record every turn we upload, completed or not. Codex fires `Stop` before
     // the just-ended turn's `task_complete` reaches the rollout, so waiting for

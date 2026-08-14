@@ -2059,6 +2059,24 @@ const $ZodEnum = /* @__PURE__ */ $constructor("$ZodEnum", (inst, def) => {
 		return payload;
 	};
 });
+const $ZodLiteral = /* @__PURE__ */ $constructor("$ZodLiteral", (inst, def) => {
+	$ZodType.init(inst, def);
+	if (def.values.length === 0) throw new Error("Cannot create literal schema with no valid values");
+	const values = new Set(def.values);
+	inst._zod.values = values;
+	inst._zod.pattern = /* @__PURE__ */ new RegExp(`^(${def.values.map((o) => typeof o === "string" ? escapeRegex(o) : o ? escapeRegex(o.toString()) : String(o)).join("|")})$`);
+	inst._zod.parse = (payload, _ctx) => {
+		const input = payload.value;
+		if (values.has(input)) return payload;
+		payload.issues.push({
+			code: "invalid_value",
+			values: def.values,
+			input,
+			inst
+		});
+		return payload;
+	};
+});
 const $ZodTransform = /* @__PURE__ */ $constructor("$ZodTransform", (inst, def) => {
 	$ZodType.init(inst, def);
 	inst._zod.optin = "optional";
@@ -3226,6 +3244,27 @@ const enumProcessor = (schema, _ctx, json, _params) => {
 	if (values.every((v) => typeof v === "string")) json.type = "string";
 	json.enum = values;
 };
+const literalProcessor = (schema, ctx, json, _params) => {
+	const def = schema._zod.def;
+	const vals = [];
+	for (const val of def.values) if (val === void 0) {
+		if (ctx.unrepresentable === "throw") throw new Error("Literal `undefined` cannot be represented in JSON Schema");
+	} else if (typeof val === "bigint") if (ctx.unrepresentable === "throw") throw new Error("BigInt literals cannot be represented in JSON Schema");
+	else vals.push(Number(val));
+	else vals.push(val);
+	if (vals.length === 0) {} else if (vals.length === 1) {
+		const val = vals[0];
+		json.type = val === null ? "null" : typeof val;
+		if (ctx.target === "draft-04" || ctx.target === "openapi-3.0") json.enum = [val];
+		else json.const = val;
+	} else {
+		if (vals.every((v) => typeof v === "number")) json.type = "number";
+		if (vals.every((v) => typeof v === "string")) json.type = "string";
+		if (vals.every((v) => typeof v === "boolean")) json.type = "boolean";
+		if (vals.every((v) => v === null)) json.type = "null";
+		json.enum = vals;
+	}
+};
 const customProcessor = (_schema, ctx, _json, _params) => {
 	if (ctx.unrepresentable === "throw") throw new Error("Custom types cannot be represented in JSON Schema");
 };
@@ -4085,6 +4124,23 @@ function _enum(values, params) {
 		...normalizeParams(params)
 	});
 }
+const ZodLiteral = /* @__PURE__ */ $constructor("ZodLiteral", (inst, def) => {
+	$ZodLiteral.init(inst, def);
+	ZodType.init(inst, def);
+	inst._zod.processJSONSchema = (ctx, json, params) => literalProcessor(inst, ctx, json, params);
+	inst.values = new Set(def.values);
+	Object.defineProperty(inst, "value", { get() {
+		if (def.values.length > 1) throw new Error("This schema contains multiple valid literal values. Use `.values` instead.");
+		return def.values[0];
+	} });
+});
+function literal(value, params) {
+	return new ZodLiteral({
+		type: "literal",
+		values: Array.isArray(value) ? value : [value],
+		...normalizeParams(params)
+	});
+}
 const ZodTransform = /* @__PURE__ */ $constructor("ZodTransform", (inst, def) => {
 	$ZodTransform.init(inst, def);
 	ZodType.init(inst, def);
@@ -4275,6 +4331,7 @@ const ConfigSchema = object({
 	tags: array(string()).optional(),
 	metadata: record(string(), string()).optional(),
 	trace_seed: string().optional(),
+	support_context_dir: string().refine(path.isAbsolute, "must be an absolute path"),
 	pricing_mode: _enum([
 		"standard",
 		"batch",
@@ -4403,6 +4460,7 @@ function readEnvConfig(env) {
 		tags: parseTags(env.LANGFUSE_CODEX_TAGS),
 		metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
 		trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
+		support_context_dir: env.LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR,
 		pricing_mode: env.LANGFUSE_CODEX_PRICING_MODE,
 		regional_processing: parseBoolean(env.LANGFUSE_CODEX_REGIONAL_PROCESSING),
 		max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
@@ -4411,19 +4469,20 @@ function readEnvConfig(env) {
 	}));
 }
 const getHomeDir = () => process.env.HOME ?? os$2.homedir();
-function getCodexAuthFile(home, env) {
-	const codexHome = env.CODEX_HOME?.trim();
-	return codexHome ? path.join(codexHome, "auth.json") : path.join(home, ".codex", "auth.json");
+function getCodexHome(home, env) {
+	return env.CODEX_HOME?.trim() || path.join(home, ".codex");
 }
 async function getConfig(options) {
 	const home = options?.home ?? getHomeDir();
 	const cwd = options?.cwd ?? process.cwd();
 	const env = options?.env ?? process.env;
+	const codexHome = getCodexHome(home, env);
 	const [globalConfig$1, localConfig] = await Promise.all([readConfigFile(path.join(home, ".codex", "langfuse.json")), readConfigFile(path.join(cwd, ".codex", "langfuse.json"))]);
 	const envConfig = readEnvConfig(env);
-	const codexUserId = globalConfig$1?.user_id ?? localConfig?.user_id ?? envConfig.user_id ? void 0 : await readCodexUserEmail(getCodexAuthFile(home, env));
+	const codexUserId = globalConfig$1?.user_id ?? localConfig?.user_id ?? envConfig.user_id ? void 0 : await readCodexUserEmail(path.join(codexHome, "auth.json"));
 	return ConfigSchema.parse({
 		...DEFAULTS,
+		support_context_dir: path.join(codexHome, "cctrace", "support-context"),
 		...codexUserId ? { user_id: codexUserId } : {},
 		...globalConfig$1,
 		...localConfig,
@@ -47040,8 +47099,61 @@ async function markTurnUploaded(rolloutFile, turnId) {
 }
 
 //#endregion
+//#region src/support-context.ts
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const MAX_CONTEXT_BYTES = 16 * 1024;
+const IdentifierSchema = string().regex(IDENTIFIER);
+const SupportTraceContextSchema = object({
+	version: literal(1),
+	thread_id: IdentifierSchema,
+	turn_id: IdentifierSchema,
+	session_id: IdentifierSchema,
+	user_id: IdentifierSchema,
+	run_id: IdentifierSchema,
+	environment: IdentifierSchema,
+	channel: IdentifierSchema,
+	trace_seed: IdentifierSchema,
+	prompt_version: IdentifierSchema.optional(),
+	created_at: string().datetime({ offset: true })
+}).strict();
+function safeIdentifier(value) {
+	return IDENTIFIER.test(value);
+}
+/**
+* Read CloseClaw's per-turn tracing context without ever blocking an upload.
+*
+* The Adapter writes `<root>/<threadId>/<turnId>.json` atomically with mode
+* 0600. Both path components and the document are validated again here so a
+* malformed rollout or sidecar cannot escape the configured directory or add
+* arbitrary Langfuse attributes.
+*/
+async function loadSupportTraceContext(root, threadId, turnId) {
+	if (!path.isAbsolute(root) || !safeIdentifier(threadId) || !safeIdentifier(turnId)) {
+		debugLog("ignored support context with an unsafe root, thread id, or turn id");
+		return;
+	}
+	const file = path.join(root, threadId, `${turnId}.json`);
+	try {
+		const info = await fs.lstat(file);
+		if (!info.isFile() || info.size > MAX_CONTEXT_BYTES) {
+			debugLog(`ignored invalid support context for ${threadId}/${turnId}`);
+			return;
+		}
+		const parsed = SupportTraceContextSchema.safeParse(JSON.parse(await fs.readFile(file, "utf-8")));
+		if (!parsed.success || parsed.data.thread_id !== threadId || parsed.data.turn_id !== turnId) {
+			debugLog(`ignored mismatched support context for ${threadId}/${turnId}`);
+			return;
+		}
+		return parsed.data;
+	} catch (error) {
+		if (error.code !== "ENOENT") debugLog(`could not read support context for ${threadId}/${turnId}`);
+		return;
+	}
+}
+
+//#endregion
 //#region ../../package.json
-var version = "0.2.4";
+var version = "0.2.5";
 
 //#endregion
 //#region src/version.ts
@@ -47056,7 +47168,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.2.2";
+const TRACE_PATCH_VERSION = "2.3.0";
 async function loadSession(file) {
 	const data = await fs.readFile(file, "utf-8");
 	const lines = [];
@@ -47114,11 +47226,12 @@ const SEED_PARENT_SPAN_ID = "0123456789abcdef";
 * thread exists. Returns `undefined` (auto-generated ids) when no seed is set
 * or derivation fails — the hook must never block an upload.
 */
-async function seededTraceParent(config$1, sessionMeta, turnNumber) {
-	if (!config$1.trace_seed) return void 0;
+async function seededTraceParent(config$1, sessionMeta, turnNumber, supportTraceSeed) {
+	const traceSeed = supportTraceSeed ?? config$1.trace_seed;
+	if (!traceSeed) return void 0;
 	try {
 		return {
-			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${config$1.trace_seed}:${sessionMeta.sessionId}:${turnNumber}` : `${config$1.trace_seed}:${turnNumber}`),
+			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}`),
 			spanId: SEED_PARENT_SPAN_ID,
 			traceFlags: TraceFlags.SAMPLED,
 			isRemote: true
@@ -47188,6 +47301,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 		startTime: new Date(turn.startTime),
 		parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent
 	});
+	if (ctx.traceAttributes) context.with(trace.setSpan(context.active(), root.otelSpan), () => propagateAttributes(ctx.traceAttributes, () => void 0));
 	let previousToolResults = void 0;
 	for (let i = 0; i < turn.steps.length; i++) {
 		const step = turn.steps[i];
@@ -47278,19 +47392,38 @@ async function convertRollout(rolloutFile, options) {
 		const turn = turns[turnIndex];
 		if (turn.turnId && uploaded.has(turn.turnId)) continue;
 		if (turn.userInput == null && turn.finalOutput == null && turn.steps.length === 0 && turn.subagentThreadIds.length === 0) continue;
-		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1);
-		await propagateAttributes({
-			sessionId: sessionMeta.sessionId,
+		const supportContext = turn.turnId ? await loadSupportTraceContext(options.config.support_context_dir, sessionMeta.sessionId, turn.turnId) : void 0;
+		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1, supportContext?.trace_seed);
+		const userId = supportContext?.user_id ?? options.config.user_id;
+		const tags = [...options.config.tags ?? [], ...supportContext ? [
+			"closeclaw-support",
+			`environment:${supportContext.environment}`,
+			`channel:${supportContext.channel}`
+		] : []].filter((value, index, values) => values.indexOf(value) === index);
+		const metadata = {
+			...options.config.metadata ?? {},
+			...supportContext ? {
+				"cctrace.context_source": "closeclaw-support-v1",
+				"closeclaw.run_id": supportContext.run_id,
+				"closeclaw.environment": supportContext.environment,
+				"closeclaw.channel": supportContext.channel,
+				"codex.thread_id": sessionMeta.sessionId,
+				...turn.turnId ? { "codex.turn_id": turn.turnId } : {},
+				...supportContext.prompt_version ? { "closeclaw.prompt_version": supportContext.prompt_version } : {}
+			} : {}
+		};
+		const traceAttributes = {
+			sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
 			traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
-			...options.config.user_id ? { userId: options.config.user_id } : {},
-			...options.config.tags ? { tags: options.config.tags } : {},
-			...options.config.metadata ? { metadata: options.config.metadata } : {}
-		}, async () => {
-			await emitTurn(turn, sessionMeta, {
-				config: options.config,
-				rolloutFile,
-				seededParent
-			});
+			...userId ? { userId } : {},
+			...tags.length > 0 ? { tags } : {},
+			...Object.keys(metadata).length > 0 ? { metadata } : {}
+		};
+		await emitTurn(turn, sessionMeta, {
+			config: options.config,
+			rolloutFile,
+			seededParent,
+			traceAttributes
 		});
 		if (turn.turnId) {
 			uploaded.add(turn.turnId);

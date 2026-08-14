@@ -35,6 +35,8 @@ export const ConfigSchema = z.object({
   metadata: z.record(z.string(), z.string()).optional(),
   // LANGFUSE_CODEX_TRACE_SEED — deterministic trace ids derived from this seed
   trace_seed: z.string().optional(),
+  // LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR — per-thread/turn CloseClaw context sidecars
+  support_context_dir: z.string().refine(path.isAbsolute, "must be an absolute path"),
   // LANGFUSE_CODEX_PRICING_MODE — OpenAI service mode used for list-price cost
   pricing_mode: z.enum(["standard", "batch", "flex", "priority"]),
   // LANGFUSE_CODEX_REGIONAL_PROCESSING — OpenAI regional processing adds 10%
@@ -206,6 +208,7 @@ function readEnvConfig(env: Record<string, string | undefined>): Partial<Config>
       tags: parseTags(env.LANGFUSE_CODEX_TAGS),
       metadata: parseMetadata(env.LANGFUSE_CODEX_METADATA),
       trace_seed: env.LANGFUSE_CODEX_TRACE_SEED,
+      support_context_dir: env.LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR,
       pricing_mode: env.LANGFUSE_CODEX_PRICING_MODE,
       regional_processing: parseBoolean(env.LANGFUSE_CODEX_REGIONAL_PROCESSING),
       max_chars: parseInteger(env.LANGFUSE_CODEX_MAX_CHARS),
@@ -217,9 +220,9 @@ function readEnvConfig(env: Record<string, string | undefined>): Partial<Config>
 
 const getHomeDir = () => process.env.HOME ?? os.homedir();
 
-function getCodexAuthFile(home: string, env: Record<string, string | undefined>): string {
+function getCodexHome(home: string, env: Record<string, string | undefined>): string {
   const codexHome = env.CODEX_HOME?.trim();
-  return codexHome ? path.join(codexHome, "auth.json") : path.join(home, ".codex", "auth.json");
+  return codexHome || path.join(home, ".codex");
 }
 
 export async function getConfig(options?: {
@@ -230,6 +233,7 @@ export async function getConfig(options?: {
   const home = options?.home ?? getHomeDir();
   const cwd = options?.cwd ?? process.cwd();
   const env = options?.env ?? process.env;
+  const codexHome = getCodexHome(home, env);
 
   const [globalConfig, localConfig] = await Promise.all([
     readConfigFile(path.join(home, ".codex", "langfuse.json")),
@@ -239,10 +243,11 @@ export async function getConfig(options?: {
   const explicitUserId = globalConfig?.user_id ?? localConfig?.user_id ?? envConfig.user_id;
   const codexUserId = explicitUserId
     ? undefined
-    : await readCodexUserEmail(getCodexAuthFile(home, env));
+    : await readCodexUserEmail(path.join(codexHome, "auth.json"));
 
   return ConfigSchema.parse({
     ...DEFAULTS,
+    support_context_dir: path.join(codexHome, "cctrace", "support-context"),
     ...(codexUserId ? { user_id: codexUserId } : {}),
     ...globalConfig,
     ...localConfig,

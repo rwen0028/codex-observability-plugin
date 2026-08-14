@@ -36,6 +36,7 @@ const baseConfig: Config = {
   debug: false,
   fail_on_error: false,
   trace_seed: "ci-run-42",
+  support_context_dir: path.join(os.tmpdir(), "missing-cctrace-support-context"),
 };
 
 const fixturesRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/sessions");
