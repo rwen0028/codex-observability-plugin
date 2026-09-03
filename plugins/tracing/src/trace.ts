@@ -35,7 +35,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.4.0";
+const TRACE_PATCH_VERSION = "2.4.1";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
@@ -89,24 +89,22 @@ const SEED_PARENT_SPAN_ID = "0123456789abcdef";
  *
  * The main-thread form deliberately excludes the thread id so external systems
  * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
- * thread exists. Without an explicit seed, the Codex session and turn ids form
- * a private stable seed so a retry after an ambiguous exporter failure targets
- * the same Langfuse trace instead of creating a second top-level trace.
+ * thread exists. Without an explicit seed, use an ordinary root span: a
+ * synthetic parent span id is not a real Langfuse observation and makes some
+ * Langfuse versions render the trace-level input/output as empty.
  */
 async function seededTraceParent(
   config: Config,
   sessionMeta: SessionMeta,
   turnNumber: number,
-  turnId?: string,
   supportTraceSeed?: string,
 ): Promise<SpanContext | undefined> {
   const traceSeed = supportTraceSeed ?? config.trace_seed;
+  if (!traceSeed) return undefined;
   try {
-    const seed = traceSeed
-      ? sessionMeta.isSubagentThread
-        ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
-        : `${traceSeed}:${turnNumber}`
-      : `cctrace:${sessionMeta.sessionId}:${turnId ?? turnNumber}`;
+    const seed = sessionMeta.isSubagentThread
+      ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
+      : `${traceSeed}:${turnNumber}`;
     return {
       traceId: await createTraceId(seed),
       spanId: SEED_PARENT_SPAN_ID,
@@ -214,9 +212,10 @@ async function emitTurn(
     },
   );
 
-  // propagateAttributes updates an existing active span. Applying it before
-  // the root exists stores only context values, so user/session metadata would
-  // never reach the exported trace. Make the root active for this update.
+  // The root observation must also carry the support/user attributes because
+  // explicit trace seeds use a synthetic parent span. The outer call in
+  // convertRollout supplies trace-level attributes; this updates the active
+  // root observation as well.
   if (ctx.traceAttributes) {
     otelContext.with(otelTrace.setSpan(otelContext.active(), root.otelSpan), () =>
       propagateAttributes(ctx.traceAttributes!, () => undefined),
@@ -381,7 +380,6 @@ export async function convertRollout(
         options.config,
         sessionMeta,
         turnNumber,
-        turn.turnId,
         supportContext?.trace_seed,
       );
       const userId = supportContext?.user_id ?? options.config.user_id;
@@ -419,11 +417,13 @@ export async function convertRollout(
         ...(tags.length > 0 ? { tags } : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       };
-      await emitTurn(turn, sessionMeta, {
-        config: options.config,
-        rolloutFile,
-        seededParent,
-        traceAttributes,
+      await propagateAttributes(traceAttributes, async () => {
+        await emitTurn(turn, sessionMeta, {
+          config: options.config,
+          rolloutFile,
+          seededParent,
+          traceAttributes,
+        });
       });
       emittedTurns++;
       if (turn.turnId) {

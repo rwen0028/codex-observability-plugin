@@ -47,7 +47,6 @@ function stageFixtures(): string {
  */
 const seededTraceId = (seed: string): string =>
   createHash("sha256").update(seed).digest("hex").slice(0, 32);
-const deterministicParentSpanId = "0123456789abcdef";
 
 const attr = (span: ReadableSpan, key: string): string =>
   span.attributes[key] == null ? "" : String(span.attributes[key]);
@@ -81,7 +80,7 @@ describe("convertRollout", () => {
     const root = spans.find((s) => s.name === "Codex Turn");
     expect(root, "expected a 'Codex Turn' root span").toBeDefined();
     expect(obsType(root!)).toBe("agent");
-    expect(parentId(root!)).toBe(deterministicParentSpanId);
+    expect(parentId(root!)).toBeUndefined();
     expect(attr(root!, "langfuse.observation.input")).toContain("List the files");
     expect(attr(root!, "langfuse.observation.output")).toContain("two files");
 
@@ -156,7 +155,7 @@ describe("convertRollout", () => {
     const child = spans.find((s) => s.name === "Codex Subagent Turn" && obsType(s) === "agent");
     expect(parent).toBeDefined();
     expect(child).toBeDefined();
-    expect(parentId(parent!)).toBe(deterministicParentSpanId);
+    expect(parentId(parent!)).toBeUndefined();
     expect(parentId(child!)).toBeDefined();
 
     // The subagent turn is nested somewhere under the parent's trace.
@@ -240,14 +239,15 @@ describe("convertRollout", () => {
     const dir = stageFixtures();
     const file = path.join(dir, "rollout-basic-main.jsonl");
 
-    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    const seededConfig = { ...baseConfig, trace_seed: "retry-seed" };
+    await convertRollout(file, { config: seededConfig, deferCommit: true });
     const firstTraceId = exporter
       .getFinishedSpans()
       .find((span) => span.name === "Codex Turn")!
       .spanContext().traceId;
     exporter.reset();
 
-    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    await convertRollout(file, { config: seededConfig, deferCommit: true });
     const retryTraceId = exporter
       .getFinishedSpans()
       .find((span) => span.name === "Codex Turn")!
@@ -452,14 +452,15 @@ describe("deterministic trace ids (trace_seed)", () => {
     }
   });
 
-  it("uses session and turn ids as an idempotency seed when no seed is configured", async () => {
+  it("uses ordinary root spans when no seed is configured", async () => {
     const dir = stageFixtures();
     await convertRollout(path.join(dir, "rollout-two-turns-main.jsonl"), { config: baseConfig });
 
     const roots = turnRoots();
     expect(roots).toHaveLength(2);
-    expect(roots[0].spanContext().traceId).toBe(seededTraceId("cctrace:sess-two-turns:turn-a"));
-    expect(roots[1].spanContext().traceId).toBe(seededTraceId("cctrace:sess-two-turns:turn-b"));
+    expect(parentId(roots[0])).toBeUndefined();
+    expect(parentId(roots[1])).toBeUndefined();
+    expect(roots[0].spanContext().traceId).not.toBe(roots[1].spanContext().traceId);
   });
 
   it("keeps sidecar dedup working when a seed is set", async () => {

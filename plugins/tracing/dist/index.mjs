@@ -47483,7 +47483,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.6";
+var version = "0.2.7";
 
 //#endregion
 //#region src/version.ts
@@ -47498,7 +47498,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.4.0";
+const TRACE_PATCH_VERSION = "2.4.1";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *
@@ -47541,15 +47541,16 @@ const SEED_PARENT_SPAN_ID = "0123456789abcdef";
 *
 * The main-thread form deliberately excludes the thread id so external systems
 * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
-* thread exists. Without an explicit seed, the Codex session and turn ids form
-* a private stable seed so a retry after an ambiguous exporter failure targets
-* the same Langfuse trace instead of creating a second top-level trace.
+* thread exists. Without an explicit seed, use an ordinary root span: a
+* synthetic parent span id is not a real Langfuse observation and makes some
+* Langfuse versions render the trace-level input/output as empty.
 */
-async function seededTraceParent(config$1, sessionMeta, turnNumber, turnId, supportTraceSeed) {
+async function seededTraceParent(config$1, sessionMeta, turnNumber, supportTraceSeed) {
 	const traceSeed = supportTraceSeed ?? config$1.trace_seed;
+	if (!traceSeed) return void 0;
 	try {
 		return {
-			traceId: await createTraceId(traceSeed ? sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}` : `cctrace:${sessionMeta.sessionId}:${turnId ?? turnNumber}`),
+			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}`),
 			spanId: SEED_PARENT_SPAN_ID,
 			traceFlags: TraceFlags.SAMPLED,
 			isRemote: true
@@ -47710,7 +47711,7 @@ async function convertRollout(rolloutFile, options) {
 				return;
 			}
 			const supportContext = turn.turnId ? await loadSupportTraceContext(options.config.support_context_dir, sessionMeta.sessionId, turn.turnId) : void 0;
-			const seededParent = await seededTraceParent(options.config, sessionMeta, turnNumber, turn.turnId, supportContext?.trace_seed);
+			const seededParent = await seededTraceParent(options.config, sessionMeta, turnNumber, supportContext?.trace_seed);
 			const userId = supportContext?.user_id ?? options.config.user_id;
 			const tags = [...options.config.tags ?? [], ...supportContext ? [
 				"closeclaw-support",
@@ -47736,11 +47737,13 @@ async function convertRollout(rolloutFile, options) {
 				...tags.length > 0 ? { tags } : {},
 				...Object.keys(metadata).length > 0 ? { metadata } : {}
 			};
-			await emitTurn(turn, sessionMeta, {
-				config: options.config,
-				rolloutFile,
-				seededParent,
-				traceAttributes
+			await propagateAttributes(traceAttributes, async () => {
+				await emitTurn(turn, sessionMeta, {
+					config: options.config,
+					rolloutFile,
+					seededParent,
+					traceAttributes
+				});
 			});
 			emittedTurns++;
 			if (turn.turnId) {
