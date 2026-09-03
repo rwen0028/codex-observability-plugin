@@ -1,7 +1,9 @@
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import * as fs from "node:fs/promises";
 import * as os$2 from "node:os";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import * as zlib from "zlib";
 import { Readable } from "stream";
 
@@ -4488,6 +4490,68 @@ async function getConfig(options) {
 		...localConfig,
 		...envConfig
 	});
+}
+
+//#endregion
+//#region src/utils.ts
+/** Read and JSON-parse the hook payload Codex writes to stdin. */
+function readStdin() {
+	return new Promise((resolve, reject) => {
+		let buffer = "";
+		process.stdin.setEncoding("utf-8");
+		process.stdin.on("data", (chunk) => buffer += chunk);
+		process.stdin.on("end", () => {
+			const trimmed = buffer.trim();
+			if (!trimmed) {
+				reject(/* @__PURE__ */ new Error("empty hook stdin"));
+				return;
+			}
+			try {
+				resolve(JSON.parse(trimmed));
+			} catch (error) {
+				reject(/* @__PURE__ */ new Error(`failed to parse hook stdin: ${error instanceof Error ? error.message : String(error)}`));
+			}
+		});
+		process.stdin.once("error", reject);
+	});
+}
+function isPrimitive(value) {
+	const t = typeof value;
+	return t === "string" || t === "number" || t === "boolean";
+}
+/** Stringify a value for display, leaving strings untouched. */
+function toText(value) {
+	if (value == null) return "";
+	if (typeof value === "string") return value;
+	if (isPrimitive(value)) return String(value);
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return String(value);
+	}
+}
+/**
+* Truncate large text to keep traces lightweight. Returns the (possibly
+* shortened) value plus metadata describing what was dropped, or `undefined`
+* metadata when nothing was truncated.
+*/
+function truncate(value, maxChars) {
+	if (value.length <= maxChars) return { text: value };
+	return {
+		text: value.slice(0, maxChars),
+		meta: {
+			truncated: true,
+			originalLength: value.length
+		}
+	};
+}
+let debugEnabled = false;
+function setDebug(enabled) {
+	debugEnabled = enabled;
+}
+function debugLog(...args) {
+	if (!debugEnabled) return;
+	console.error("[langfuse-codex]", ...args);
 }
 
 //#endregion
@@ -46167,6 +46231,141 @@ function setupInstrumentation(config$1) {
 }
 
 //#endregion
+//#region src/sidecar.ts
+const STATE_VERSION = 2;
+const STATUS_VERSION = 1;
+const ledgerPath = (rolloutFile) => `${rolloutFile}.langfuse`;
+const statePath = (rolloutFile) => `${rolloutFile}.langfuse.state.json`;
+const pendingPath = (rolloutFile) => `${rolloutFile}.langfuse.pending.json`;
+const statusPath = (rolloutFile) => `${rolloutFile}.langfuse.status.json`;
+const lockPath = (rolloutFile) => `${rolloutFile}.langfuse.lock`;
+async function writeJsonAtomic(file, value) {
+	const temporary = `${file}.tmp.${process.pid}.${Date.now()}`;
+	await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
+		encoding: "utf-8",
+		mode: 384
+	});
+	const handle = await fs.open(temporary, "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	try {
+		await fs.rename(temporary, file);
+		await fs.chmod(file, 384);
+	} catch (error) {
+		await fs.rm(temporary, { force: true }).catch(() => void 0);
+		throw error;
+	}
+}
+function isSessionMeta(value) {
+	if (value == null || typeof value !== "object" || Array.isArray(value)) return false;
+	return typeof value.sessionId === "string";
+}
+function cleanError(error) {
+	return (error instanceof Error ? error.message : String(error)).replace(/(authorization|api[-_ ]?key|secret|token|password)\s*[:=]\s*\S+/gi, "$1=[redacted]").slice(0, 500);
+}
+/**
+* Per-rollout dedup ledger.
+*
+* The `Stop` hook fires after every Codex turn. We retain the legacy newline
+* ledger (`<rolloutFile>.langfuse`) for backwards compatibility and combine it
+* with a v2 byte-offset checkpoint. A turn id is appended only after the
+* exporter flush succeeds; in-progress but contentful turns are acknowledged
+* too because Codex may trigger Stop before task_complete reaches the file.
+*/
+async function loadUploadedTurnIds(rolloutFile) {
+	try {
+		const data = await fs.readFile(ledgerPath(rolloutFile), "utf-8");
+		return new Set(data.split("\n").filter(Boolean));
+	} catch (error) {
+		if (error.code === "ENOENT") return /* @__PURE__ */ new Set();
+		throw error;
+	}
+}
+/** Append acknowledgements durably after the exporter has flushed successfully. */
+async function markTurnsUploaded(rolloutFile, turnIds) {
+	if (turnIds.length === 0) return;
+	const file = ledgerPath(rolloutFile);
+	const handle = await fs.open(file, "a", 384);
+	try {
+		await handle.writeFile(`${turnIds.join("\n")}\n`, "utf-8");
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fs.chmod(file, 384);
+}
+function rolloutIdentity(stat) {
+	return {
+		device: String(stat.dev),
+		inode: String(stat.ino)
+	};
+}
+async function loadUploadState(rolloutFile, stat) {
+	try {
+		const value = JSON.parse(await fs.readFile(statePath(rolloutFile), "utf-8"));
+		const identity = rolloutIdentity(stat);
+		if (value.version !== STATE_VERSION || value.identity?.device !== identity.device || value.identity?.inode !== identity.inode || !Number.isSafeInteger(value.committedOffset) || value.committedOffset < 0 || value.committedOffset > stat.size || !Number.isSafeInteger(value.turnNumber) || value.turnNumber < 0 || !isSessionMeta(value.sessionMeta)) return;
+		return value;
+	} catch {
+		return;
+	}
+}
+async function writeUploadState(rolloutFile, state) {
+	await writeJsonAtomic(statePath(rolloutFile), state);
+}
+/** Leave a durable watermark before the Stop hook exits. */
+async function queueRollout(rolloutFile, snapshotBytes) {
+	await writeJsonAtomic(pendingPath(rolloutFile), {
+		version: 1,
+		snapshotBytes,
+		queuedAt: (/* @__PURE__ */ new Date()).toISOString()
+	});
+}
+async function writeUploadStatus(rolloutFile, status) {
+	await writeJsonAtomic(statusPath(rolloutFile), {
+		version: STATUS_VERSION,
+		updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+		...status,
+		...status.error ? { error: cleanError(status.error) } : {}
+	});
+}
+function processIsAlive(pid) {
+	if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error.code === "EPERM";
+	}
+}
+/** Acquire a per-rollout lock, recovering a lock left by a dead uploader. */
+async function acquireRolloutLock(rolloutFile) {
+	const file = lockPath(rolloutFile);
+	for (let attempt = 0; attempt < 2; attempt++) try {
+		const handle = await fs.open(file, "wx", 384);
+		await handle.writeFile(`${process.pid}\n`, "utf-8");
+		await handle.close();
+		let released = false;
+		return { release: async () => {
+			if (released) return;
+			released = true;
+			await fs.rm(file, { force: true });
+		} };
+	} catch (error) {
+		if (error.code !== "EEXIST") throw error;
+		let owner = 0;
+		try {
+			owner = Number.parseInt((await fs.readFile(file, "utf-8")).trim(), 10);
+		} catch {}
+		if (processIsAlive(owner)) return void 0;
+		await fs.rm(file, { force: true });
+	}
+}
+
+//#endregion
 //#region ../../node_modules/.pnpm/@langfuse+tracing@5.4.1_@opentelemetry+api@1.9.1/node_modules/@langfuse/tracing/dist/index.mjs
 init_esm$2();
 function createTraceAttributes({ input, output } = {}) {
@@ -46626,65 +46825,124 @@ function uint8ArrayToHex(array$1) {
 }
 
 //#endregion
-//#region src/utils.ts
-/** Read and JSON-parse the hook payload Codex writes to stdin. */
-function readStdin() {
-	return new Promise((resolve, reject) => {
-		let buffer = "";
-		process.stdin.setEncoding("utf-8");
-		process.stdin.on("data", (chunk) => buffer += chunk);
-		process.stdin.on("end", () => {
-			const trimmed = buffer.trim();
-			if (!trimmed) {
-				reject(/* @__PURE__ */ new Error("empty hook stdin"));
-				return;
-			}
-			try {
-				resolve(JSON.parse(trimmed));
-			} catch (error) {
-				reject(/* @__PURE__ */ new Error(`failed to parse hook stdin: ${error instanceof Error ? error.message : String(error)}`));
-			}
-		});
-		process.stdin.once("error", reject);
-	});
-}
-function isPrimitive(value) {
-	const t = typeof value;
-	return t === "string" || t === "number" || t === "boolean";
-}
-/** Stringify a value for display, leaving strings untouched. */
-function toText(value) {
-	if (value == null) return "";
-	if (typeof value === "string") return value;
-	if (isPrimitive(value)) return String(value);
-	try {
-		return JSON.stringify(value);
-	} catch {
-		return String(value);
+//#region src/pricing.ts
+const PER_MILLION = 1e6;
+const LONG_CONTEXT_THRESHOLD = 272e3;
+/** Official OpenAI prices, USD per 1M tokens, published 2026-07-09. */
+const GPT_56_STANDARD_SHORT = {
+	sol: {
+		input: 5,
+		input_cached: .5,
+		input_cache_write: 6.25,
+		output: 30
+	},
+	terra: {
+		input: 2.5,
+		input_cached: .25,
+		input_cache_write: 3.125,
+		output: 15
+	},
+	luna: {
+		input: 1,
+		input_cached: .1,
+		input_cache_write: 1.25,
+		output: 6
 	}
+};
+function nonNegative(value) {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 /**
-* Truncate large text to keep traces lightweight. Returns the (possibly
-* shortened) value plus metadata describing what was dropped, or `undefined`
-* metadata when nothing was truncated.
+* Codex reports inclusive input/output totals plus cached/reasoning subsets.
+* Langfuse requires arbitrary usage buckets to be mutually exclusive, so split
+* the inclusive totals before sending either usage or cost details.
 */
-function truncate(value, maxChars) {
-	if (value.length <= maxChars) return { text: value };
+function normalizeUsage(usage) {
+	if (!usage) return void 0;
+	const inputTotal = nonNegative(usage.input_tokens);
+	const inputCached = nonNegative(usage.cached_input_tokens);
+	const inputCacheWrite = nonNegative(usage.cache_write_input_tokens ?? usage.cache_creation_input_tokens);
+	const outputTotal = nonNegative(usage.output_tokens);
+	const outputReasoning = nonNegative(usage.reasoning_output_tokens);
+	const details = {};
+	if (typeof usage.input_tokens === "number") details.input = Math.max(0, inputTotal - inputCached - inputCacheWrite);
+	if (typeof usage.cached_input_tokens === "number") details.input_cached = inputCached;
+	if (typeof usage.cache_write_input_tokens === "number" || typeof usage.cache_creation_input_tokens === "number") details.input_cache_write = inputCacheWrite;
+	if (typeof usage.output_tokens === "number") details.output = Math.max(0, outputTotal - outputReasoning);
+	if (typeof usage.reasoning_output_tokens === "number") details.output_reasoning = outputReasoning;
+	if (typeof usage.total_tokens === "number") details.total = nonNegative(usage.total_tokens);
+	return Object.keys(details).length > 0 ? details : void 0;
+}
+function modelTier(model) {
+	const normalized = model?.toLowerCase().replace(/^openai\//, "");
+	if (normalized === "gpt-5.6" || normalized === "gpt-5.6-sol") return "sol";
+	if (normalized === "gpt-5.6-terra") return "terra";
+	if (normalized === "gpt-5.6-luna") return "luna";
+}
+function pricingMode(turn, configured) {
+	const raw = turn.invocationParams?.service_tier ?? turn.invocationParams?.serviceTier;
+	if (typeof raw !== "string") return configured;
+	const normalized = raw.toLowerCase();
+	if (normalized === "priority" || normalized === "flex" || normalized === "batch") return normalized;
+	if (normalized === "default" || normalized === "standard" || normalized === "auto") return "standard";
+	return configured;
+}
+function modeMultiplier(mode) {
+	if (mode === "batch" || mode === "flex") return .5;
+	if (mode === "priority") return 2;
+	return 1;
+}
+/**
+* Calculate official-list-price cost details for GPT-5.6 generations.
+*
+* Priority does not support >272K long-context requests. If such a combination
+* appears, omit explicit cost instead of silently inventing a price.
+*/
+function calculateGpt56Cost(model, usage, turn, options) {
+	const tier = modelTier(model);
+	if (!tier || !usage) return void 0;
+	const contextTier = nonNegative(usage.input) + nonNegative(usage.input_cached) + nonNegative(usage.input_cache_write) > LONG_CONTEXT_THRESHOLD ? "long" : "short";
+	const mode = pricingMode(turn, options.mode);
+	if (mode === "priority" && contextTier === "long") return void 0;
+	const base = GPT_56_STANDARD_SHORT[tier];
+	const processingMultiplier = modeMultiplier(mode);
+	const regionalMultiplier = options.regionalProcessing ? 1.1 : 1;
+	const inputContextMultiplier = contextTier === "long" ? 2 : 1;
+	const outputContextMultiplier = contextTier === "long" ? 1.5 : 1;
+	const prices = {
+		input: base.input * inputContextMultiplier,
+		input_cached: base.input_cached * inputContextMultiplier,
+		input_cache_write: base.input_cache_write * inputContextMultiplier,
+		output: base.output * outputContextMultiplier,
+		output_reasoning: base.output * outputContextMultiplier
+	};
+	const costDetails = {};
+	let totalCost = 0;
+	for (const [usageType, units] of Object.entries(usage)) {
+		if (usageType === "total" || prices[usageType] == null) continue;
+		const cost = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
+		costDetails[usageType] = cost;
+		totalCost += cost;
+	}
+	if (Object.keys(costDetails).length > 0) costDetails.total = totalCost;
 	return {
-		text: value.slice(0, maxChars),
-		meta: {
-			truncated: true,
-			originalLength: value.length
-		}
+		costDetails,
+		mode,
+		contextTier,
+		regionalProcessing: options.regionalProcessing
 	};
 }
-let debugEnabled = false;
-function setDebug(enabled) {
-	debugEnabled = enabled;
-}
-function debugLog(...args) {
-	if (!debugEnabled) return;
-	console.error("[langfuse-codex]", ...args);
+function reasoningEffort(turn) {
+	const direct = turn.invocationParams?.effort ?? turn.invocationParams?.reasoning_effort;
+	if (typeof direct === "string") return direct;
+	const collaborationMode = turn.invocationParams?.collaboration_mode;
+	if (collaborationMode && typeof collaborationMode === "object") {
+		const settings = collaborationMode.settings;
+		if (settings && typeof settings === "object") {
+			const value = settings.reasoning_effort;
+			if (typeof value === "string") return value;
+		}
+	}
 }
 
 //#endregion
@@ -46952,150 +47210,222 @@ function parseSession(lines) {
 }
 
 //#endregion
-//#region src/pricing.ts
-const PER_MILLION = 1e6;
-const LONG_CONTEXT_THRESHOLD = 272e3;
-/** Official OpenAI prices, USD per 1M tokens, published 2026-07-09. */
-const GPT_56_STANDARD_SHORT = {
-	sol: {
-		input: 5,
-		input_cached: .5,
-		input_cache_write: 6.25,
-		output: 30
-	},
-	terra: {
-		input: 2.5,
-		input_cached: .25,
-		input_cache_write: 3.125,
-		output: 15
-	},
-	luna: {
-		input: 1,
-		input_cached: .1,
-		input_cache_write: 1.25,
-		output: 6
-	}
-};
-function nonNegative(value) {
-	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+//#region src/stream.ts
+const READ_BUFFER_BYTES = 64 * 1024;
+const MIN_MAX_LINE_BYTES = 1024 * 1024;
+const MAX_MAX_LINE_BYTES = 16 * 1024 * 1024;
+function maxLineBytes(maxChars) {
+	return Math.max(MIN_MAX_LINE_BYTES, Math.min(MAX_MAX_LINE_BYTES, maxChars * 8));
 }
-/**
-* Codex reports inclusive input/output totals plus cached/reasoning subsets.
-* Langfuse requires arbitrary usage buckets to be mutually exclusive, so split
-* the inclusive totals before sending either usage or cost details.
-*/
-function normalizeUsage(usage) {
-	if (!usage) return void 0;
-	const inputTotal = nonNegative(usage.input_tokens);
-	const inputCached = nonNegative(usage.cached_input_tokens);
-	const inputCacheWrite = nonNegative(usage.cache_write_input_tokens ?? usage.cache_creation_input_tokens);
-	const outputTotal = nonNegative(usage.output_tokens);
-	const outputReasoning = nonNegative(usage.reasoning_output_tokens);
-	const details = {};
-	if (typeof usage.input_tokens === "number") details.input = Math.max(0, inputTotal - inputCached - inputCacheWrite);
-	if (typeof usage.cached_input_tokens === "number") details.input_cached = inputCached;
-	if (typeof usage.cache_write_input_tokens === "number" || typeof usage.cache_creation_input_tokens === "number") details.input_cache_write = inputCacheWrite;
-	if (typeof usage.output_tokens === "number") details.output = Math.max(0, outputTotal - outputReasoning);
-	if (typeof usage.reasoning_output_tokens === "number") details.output_reasoning = outputReasoning;
-	if (typeof usage.total_tokens === "number") details.total = nonNegative(usage.total_tokens);
-	return Object.keys(details).length > 0 ? details : void 0;
-}
-function modelTier(model) {
-	const normalized = model?.toLowerCase().replace(/^openai\//, "");
-	if (normalized === "gpt-5.6" || normalized === "gpt-5.6-sol") return "sol";
-	if (normalized === "gpt-5.6-terra") return "terra";
-	if (normalized === "gpt-5.6-luna") return "luna";
-}
-function pricingMode(turn, configured) {
-	const raw = turn.invocationParams?.service_tier ?? turn.invocationParams?.serviceTier;
-	if (typeof raw !== "string") return configured;
-	const normalized = raw.toLowerCase();
-	if (normalized === "priority" || normalized === "flex" || normalized === "batch") return normalized;
-	if (normalized === "default" || normalized === "standard" || normalized === "auto") return "standard";
-	return configured;
-}
-function modeMultiplier(mode) {
-	if (mode === "batch" || mode === "flex") return .5;
-	if (mode === "priority") return 2;
-	return 1;
-}
-/**
-* Calculate official-list-price cost details for GPT-5.6 generations.
-*
-* Priority does not support >272K long-context requests. If such a combination
-* appears, omit explicit cost instead of silently inventing a price.
-*/
-function calculateGpt56Cost(model, usage, turn, options) {
-	const tier = modelTier(model);
-	if (!tier || !usage) return void 0;
-	const contextTier = nonNegative(usage.input) + nonNegative(usage.input_cached) + nonNegative(usage.input_cache_write) > LONG_CONTEXT_THRESHOLD ? "long" : "short";
-	const mode = pricingMode(turn, options.mode);
-	if (mode === "priority" && contextTier === "long") return void 0;
-	const base = GPT_56_STANDARD_SHORT[tier];
-	const processingMultiplier = modeMultiplier(mode);
-	const regionalMultiplier = options.regionalProcessing ? 1.1 : 1;
-	const inputContextMultiplier = contextTier === "long" ? 2 : 1;
-	const outputContextMultiplier = contextTier === "long" ? 1.5 : 1;
-	const prices = {
-		input: base.input * inputContextMultiplier,
-		input_cached: base.input_cached * inputContextMultiplier,
-		input_cache_write: base.input_cache_write * inputContextMultiplier,
-		output: base.output * outputContextMultiplier,
-		output_reasoning: base.output * outputContextMultiplier
-	};
-	const costDetails = {};
-	let totalCost = 0;
-	for (const [usageType, units] of Object.entries(usage)) {
-		if (usageType === "total" || prices[usageType] == null) continue;
-		const cost = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
-		costDetails[usageType] = cost;
-		totalCost += cost;
-	}
-	if (Object.keys(costDetails).length > 0) costDetails.total = totalCost;
-	return {
-		costDetails,
-		mode,
-		contextTier,
-		regionalProcessing: options.regionalProcessing
-	};
-}
-function reasoningEffort(turn) {
-	const direct = turn.invocationParams?.effort ?? turn.invocationParams?.reasoning_effort;
-	if (typeof direct === "string") return direct;
-	const collaborationMode = turn.invocationParams?.collaboration_mode;
-	if (collaborationMode && typeof collaborationMode === "object") {
-		const settings = collaborationMode.settings;
-		if (settings && typeof settings === "object") {
-			const value = settings.reasoning_effort;
-			if (typeof value === "string") return value;
+/** Truncate strings before parsed events are retained in a turn-sized buffer. */
+function truncateStrings(value, maxChars) {
+	if (value == null || typeof value !== "object") return;
+	const stack = [value];
+	const seen = /* @__PURE__ */ new Set();
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (current == null || typeof current !== "object" || seen.has(current)) continue;
+		seen.add(current);
+		if (Array.isArray(current)) {
+			for (let index = 0; index < current.length; index++) {
+				const item = current[index];
+				if (typeof item === "string" && item.length > maxChars) current[index] = `${item.slice(0, maxChars)}\n…[truncated ${item.length - maxChars} chars]`;
+				else if (item != null && typeof item === "object") stack.push(item);
+			}
+			continue;
 		}
+		for (const [key, item] of Object.entries(current)) if (typeof item === "string" && item.length > maxChars) current[key] = `${item.slice(0, maxChars)}\n…[truncated ${item.length - maxChars} chars]`;
+		else if (item != null && typeof item === "object") stack.push(item);
 	}
 }
-
-//#endregion
-//#region src/sidecar.ts
+function parseLine(raw, maxChars) {
+	const trimmed = raw.trim();
+	if (!trimmed) return void 0;
+	try {
+		const line = JSON.parse(trimmed);
+		if (line == null || typeof line !== "object") return void 0;
+		truncateStrings(line, maxChars);
+		return line;
+	} catch {
+		return;
+	}
+}
+function isTaskStarted(line) {
+	return line.type === "event_msg" && line.payload.type === "task_started";
+}
+function isTaskComplete(line) {
+	return line.type === "event_msg" && line.payload.type === "task_complete";
+}
+function isFinalOutputLine(line) {
+	const payload = line.payload;
+	return line.type === "event_msg" && payload.type === "agent_message" || line.type === "response_item" && payload.type === "message" && payload.role === "assistant";
+}
+function updateSessionMeta(current, line) {
+	if (line.type !== "session_meta") return current;
+	const payload = line.payload;
+	return {
+		sessionId: typeof payload.id === "string" ? payload.id : current.sessionId,
+		cliVersion: payload.cli_version,
+		modelProvider: payload.model_provider ?? void 0,
+		isSubagentThread: typeof payload.parent_thread_id === "string" || payload.thread_source === "subagent"
+	};
+}
+async function scanCompleteLines(file, startOffset, snapshotBytes, lineLimit, onLine) {
+	if (snapshotBytes <= startOffset) return startOffset;
+	const handle = await fs.open(file, "r");
+	const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
+	let position = startOffset;
+	let committedOffset = startOffset;
+	let lineBytes = 0;
+	let oversized = false;
+	let chunks = [];
+	const addSegment = (segment) => {
+		lineBytes += segment.length;
+		if (oversized || lineBytes > lineLimit) {
+			oversized = true;
+			chunks = [];
+			return;
+		}
+		if (segment.length > 0) chunks.push(Buffer.from(segment));
+	};
+	try {
+		while (position < snapshotBytes) {
+			const wanted = Math.min(buffer.length, snapshotBytes - position);
+			const { bytesRead } = await handle.read(buffer, 0, wanted, position);
+			if (bytesRead === 0) break;
+			let segmentStart = 0;
+			for (let index = 0; index < bytesRead; index++) {
+				if (buffer[index] !== 10) continue;
+				addSegment(buffer.subarray(segmentStart, index));
+				const endOffset = position + index + 1;
+				await onLine({
+					raw: oversized ? void 0 : Buffer.concat(chunks).toString("utf-8"),
+					bytes: lineBytes,
+					endOffset
+				});
+				committedOffset = endOffset;
+				lineBytes = 0;
+				oversized = false;
+				chunks = [];
+				segmentStart = index + 1;
+			}
+			addSegment(buffer.subarray(segmentStart, bytesRead));
+			position += bytesRead;
+		}
+	} finally {
+		await handle.close();
+	}
+	return committedOffset;
+}
+function hasContent(turn) {
+	return turn.userInput != null || turn.finalOutput != null || turn.steps.length > 0 || turn.subagentThreadIds.length > 0;
+}
+function selectTurn(active) {
+	const turns = parseSession(active.lines).turns;
+	if (active.turnId) {
+		const matched = turns.find((turn) => turn.turnId === active.turnId);
+		if (matched && hasContent(matched)) return matched;
+	}
+	return turns.find(hasContent);
+}
 /**
-* Per-rollout dedup ledger.
+* Stream a rollout from its last committed byte offset.
 *
-* The `Stop` hook fires after every Codex turn and re-reads the whole rollout
-* file, so completed turns would be re-uploaded each time. We record uploaded
-* turn ids in a sidecar file (`<rolloutFile>.langfuse`) and skip them on
-* subsequent invocations. In-progress (not-yet-completed) turns are uploaded
-* but intentionally not recorded, so they finalize on the next hook run.
+* Uploaded legacy turns are detected from their task_started line and their
+* remaining bytes are read but not JSON-parsed. Unuploaded data is retained
+* for only one turn at a time. The returned state is not durable until the
+* caller has flushed the exporter and explicitly writes it.
 */
-async function loadUploadedTurnIds(rolloutFile) {
-	try {
-		const data = await fs.readFile(`${rolloutFile}.langfuse`, "utf-8");
-		return new Set(data.split("\n").filter(Boolean));
-	} catch (error) {
-		if (error.code === "ENOENT") return /* @__PURE__ */ new Set();
-		throw error;
-	}
-}
-async function markTurnUploaded(rolloutFile, turnId) {
-	try {
-		await fs.appendFile(`${rolloutFile}.langfuse`, `${turnId}\n`, "utf-8");
-	} catch {}
+async function scanRollout(rolloutFile, options) {
+	const stat = await fs.stat(rolloutFile);
+	const snapshotBytes = Math.max(0, Math.min(options.snapshotBytes ?? stat.size, stat.size));
+	const startOffset = options.previousState?.committedOffset ?? 0;
+	let sessionMeta = options.previousState?.sessionMeta ?? { sessionId: "unknown" };
+	let turnNumber = options.previousState?.turnNumber ?? 0;
+	let active;
+	let skippedTurns = 0;
+	let oversizedLines = 0;
+	let resumeOffset;
+	let resumeTurnNumber;
+	const finishActive = async (trailing) => {
+		if (!active) return;
+		const current = active;
+		active = void 0;
+		if (current.skipped) {
+			skippedTurns++;
+			return;
+		}
+		const turn = selectTurn(current);
+		const ready = !trailing || current.completed || current.finalOutputSeen || turn?.aborted === true;
+		if (turn && ready) await options.onTurn({
+			turn,
+			turnNumber: current.turnNumber,
+			sessionMeta
+		});
+		else if (trailing) {
+			resumeOffset = current.startOffset;
+			resumeTurnNumber = current.turnNumber - 1;
+		}
+	};
+	const committedOffset = await scanCompleteLines(rolloutFile, startOffset, snapshotBytes, maxLineBytes(options.maxChars), async ({ raw, bytes, endOffset }) => {
+		if (raw == null) {
+			oversizedLines++;
+			if (active && !active.skipped) active.lines.push({
+				timestamp: active.lastTimestamp,
+				type: "event_msg",
+				payload: {
+					type: "agent_message",
+					message: `[rollout event omitted: ${bytes} bytes exceeds safety limit]`
+				}
+			});
+			return;
+		}
+		if (active?.skipped && !raw.includes("task_started") && !raw.includes("session_meta")) return;
+		if (!active && !raw.includes("task_started") && !raw.includes("session_meta")) return;
+		const line = parseLine(raw, options.maxChars);
+		if (!line) return;
+		sessionMeta = updateSessionMeta(sessionMeta, line);
+		if (line.type === "session_meta") return;
+		if (isTaskStarted(line)) {
+			await finishActive(false);
+			turnNumber++;
+			const payload = line.payload;
+			const turnId = typeof payload.turn_id === "string" ? payload.turn_id : void 0;
+			active = {
+				turnId,
+				turnNumber,
+				skipped: turnId != null && options.uploadedTurnIds.has(turnId),
+				lines: [],
+				completed: false,
+				finalOutputSeen: false,
+				lastTimestamp: line.timestamp,
+				startOffset: endOffset - bytes - 1
+			};
+			if (!active.skipped) active.lines.push(line);
+			return;
+		}
+		if (active && !active.skipped) {
+			active.lastTimestamp = line.timestamp;
+			if (isTaskComplete(line)) active.completed = true;
+			if (isFinalOutputLine(line)) active.finalOutputSeen = true;
+			active.lines.push(line);
+		}
+	});
+	await finishActive(true);
+	return {
+		state: {
+			version: 2,
+			identity: rolloutIdentity(stat),
+			committedOffset: resumeOffset ?? committedOffset,
+			turnNumber: resumeTurnNumber ?? turnNumber,
+			sessionMeta,
+			updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+		},
+		snapshotBytes,
+		scannedBytes: snapshotBytes - startOffset,
+		skippedTurns,
+		oversizedLines
+	};
 }
 
 //#endregion
@@ -47153,7 +47483,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.5";
+var version = "0.2.6";
 
 //#endregion
 //#region src/version.ts
@@ -47168,19 +47498,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.3.0";
-async function loadSession(file) {
-	const data = await fs.readFile(file, "utf-8");
-	const lines = [];
-	for (const raw of data.split("\n")) {
-		const trimmed = raw.trim();
-		if (!trimmed) continue;
-		try {
-			lines.push(JSON.parse(trimmed));
-		} catch {}
-	}
-	return lines;
-}
+const TRACE_PATCH_VERSION = "2.4.0";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *
@@ -47216,28 +47534,28 @@ async function findSubagentRollout(parentFile, threadId) {
 */
 const SEED_PARENT_SPAN_ID = "0123456789abcdef";
 /**
-* Derive the deterministic trace id for a turn from `config.trace_seed`.
+* Derive a deterministic trace id for every turn.
 *
 * Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
 * Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
 *
 * The main-thread form deliberately excludes the thread id so external systems
 * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
-* thread exists. Returns `undefined` (auto-generated ids) when no seed is set
-* or derivation fails — the hook must never block an upload.
+* thread exists. Without an explicit seed, the Codex session and turn ids form
+* a private stable seed so a retry after an ambiguous exporter failure targets
+* the same Langfuse trace instead of creating a second top-level trace.
 */
-async function seededTraceParent(config$1, sessionMeta, turnNumber, supportTraceSeed) {
+async function seededTraceParent(config$1, sessionMeta, turnNumber, turnId, supportTraceSeed) {
 	const traceSeed = supportTraceSeed ?? config$1.trace_seed;
-	if (!traceSeed) return void 0;
 	try {
 		return {
-			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}`),
+			traceId: await createTraceId(traceSeed ? sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}` : `cctrace:${sessionMeta.sessionId}:${turnId ?? turnNumber}`),
 			spanId: SEED_PARENT_SPAN_ID,
 			traceFlags: TraceFlags.SAMPLED,
 			isRemote: true
 		};
 	} catch (error) {
-		debugLog("failed to derive seeded trace id; falling back to auto-generated:", error);
+		debugLog("failed to derive deterministic trace id; falling back to auto-generated:", error);
 		if (config$1.fail_on_error) throw error;
 		return;
 	}
@@ -47294,6 +47612,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			"codex.aborted": turn.aborted,
 			"codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
 			"cctrace.patch": TRACE_PATCH_VERSION,
+			"cctrace.upload_schema": 2,
 			"cctrace.plugin_version": PLUGIN_VERSION
 		}
 	}, {
@@ -47369,78 +47688,205 @@ function emitToolCall(tc, parent, clip, fallbackEnd) {
 		parentSpanContext: parent.otelSpan.spanContext()
 	}).end(new Date(tc.endTime ?? fallbackEnd));
 }
-/**
-* Convert a Codex rollout file into Langfuse traces.
-*
-* Top-level turns each become their own trace (grouped into a Langfuse session
-* via the Codex thread id). Subagent rollouts are nested under the spawning
-* turn via `parentObservation`.
-*/
 async function convertRollout(rolloutFile, options) {
-	const { sessionMeta, turns } = parseSession(await loadSession(rolloutFile));
-	debugLog(`parsed ${turns.length} turn(s) from ${path.basename(rolloutFile)}`);
-	if (options.parentObservation) {
-		for (const turn of turns) await emitTurn(turn, sessionMeta, {
-			config: options.config,
-			rolloutFile,
-			parentObservation: options.parentObservation
-		});
-		return;
-	}
-	const uploaded = await loadUploadedTurnIds(rolloutFile);
-	for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
-		const turn = turns[turnIndex];
-		if (turn.turnId && uploaded.has(turn.turnId)) continue;
-		if (turn.userInput == null && turn.finalOutput == null && turn.steps.length === 0 && turn.subagentThreadIds.length === 0) continue;
-		const supportContext = turn.turnId ? await loadSupportTraceContext(options.config.support_context_dir, sessionMeta.sessionId, turn.turnId) : void 0;
-		const seededParent = await seededTraceParent(options.config, sessionMeta, turnIndex + 1, supportContext?.trace_seed);
-		const userId = supportContext?.user_id ?? options.config.user_id;
-		const tags = [...options.config.tags ?? [], ...supportContext ? [
-			"closeclaw-support",
-			`environment:${supportContext.environment}`,
-			`channel:${supportContext.channel}`
-		] : []].filter((value, index, values) => values.indexOf(value) === index);
-		const metadata = {
-			...options.config.metadata ?? {},
-			...supportContext ? {
-				"cctrace.context_source": "closeclaw-support-v1",
-				"closeclaw.run_id": supportContext.run_id,
-				"closeclaw.environment": supportContext.environment,
-				"closeclaw.channel": supportContext.channel,
-				"codex.thread_id": sessionMeta.sessionId,
-				...turn.turnId ? { "codex.turn_id": turn.turnId } : {},
-				...supportContext.prompt_version ? { "closeclaw.prompt_version": supportContext.prompt_version } : {}
-			} : {}
-		};
-		const traceAttributes = {
-			sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
-			traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
-			...userId ? { userId } : {},
-			...tags.length > 0 ? { tags } : {},
-			...Object.keys(metadata).length > 0 ? { metadata } : {}
-		};
-		await emitTurn(turn, sessionMeta, {
-			config: options.config,
-			rolloutFile,
-			seededParent,
-			traceAttributes
-		});
-		if (turn.turnId) {
-			uploaded.add(turn.turnId);
-			await markTurnUploaded(rolloutFile, turn.turnId);
+	const uploaded = options.parentObservation ? /* @__PURE__ */ new Set() : await loadUploadedTurnIds(rolloutFile);
+	const stat = await fs.stat(rolloutFile);
+	const previousState = options.parentObservation ? void 0 : await loadUploadState(rolloutFile, stat);
+	const emittedTurnIds = [];
+	let emittedTurns = 0;
+	const scan = await scanRollout(rolloutFile, {
+		uploadedTurnIds: uploaded,
+		previousState,
+		snapshotBytes: options.snapshotBytes,
+		maxChars: options.config.max_chars,
+		onTurn: async ({ turn, turnNumber, sessionMeta }) => {
+			if (options.parentObservation) {
+				await emitTurn(turn, sessionMeta, {
+					config: options.config,
+					rolloutFile,
+					parentObservation: options.parentObservation
+				});
+				emittedTurns++;
+				return;
+			}
+			const supportContext = turn.turnId ? await loadSupportTraceContext(options.config.support_context_dir, sessionMeta.sessionId, turn.turnId) : void 0;
+			const seededParent = await seededTraceParent(options.config, sessionMeta, turnNumber, turn.turnId, supportContext?.trace_seed);
+			const userId = supportContext?.user_id ?? options.config.user_id;
+			const tags = [...options.config.tags ?? [], ...supportContext ? [
+				"closeclaw-support",
+				`environment:${supportContext.environment}`,
+				`channel:${supportContext.channel}`
+			] : []].filter((value, index, values) => values.indexOf(value) === index);
+			const metadata = {
+				...options.config.metadata ?? {},
+				...supportContext ? {
+					"cctrace.context_source": "closeclaw-support-v1",
+					"closeclaw.run_id": supportContext.run_id,
+					"closeclaw.environment": supportContext.environment,
+					"closeclaw.channel": supportContext.channel,
+					"codex.thread_id": sessionMeta.sessionId,
+					...turn.turnId ? { "codex.turn_id": turn.turnId } : {},
+					...supportContext.prompt_version ? { "closeclaw.prompt_version": supportContext.prompt_version } : {}
+				} : {}
+			};
+			const traceAttributes = {
+				sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
+				traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
+				...userId ? { userId } : {},
+				...tags.length > 0 ? { tags } : {},
+				...Object.keys(metadata).length > 0 ? { metadata } : {}
+			};
+			await emitTurn(turn, sessionMeta, {
+				config: options.config,
+				rolloutFile,
+				seededParent,
+				traceAttributes
+			});
+			emittedTurns++;
+			if (turn.turnId) {
+				uploaded.add(turn.turnId);
+				emittedTurnIds.push(turn.turnId);
+			}
 		}
+	});
+	debugLog(`scanned ${scan.scannedBytes} byte(s), emitted ${emittedTurns} turn(s) from ${path.basename(rolloutFile)}`);
+	let committed = false;
+	const commit = async () => {
+		if (committed || options.parentObservation) return;
+		await markTurnsUploaded(rolloutFile, emittedTurnIds);
+		await writeUploadState(rolloutFile, scan.state);
+		committed = true;
+	};
+	if (!options.deferCommit) await commit();
+	return {
+		emittedTurns,
+		scan,
+		commit
+	};
+}
+
+//#endregion
+//#region src/worker.ts
+const WORKER_ARGUMENT = "--cctrace-upload-worker";
+function launchUploadWorker(scriptFile$1, rolloutFile, attempt = 0) {
+	const child = spawn(process.execPath, [
+		scriptFile$1,
+		WORKER_ARGUMENT,
+		rolloutFile,
+		String(attempt)
+	], {
+		cwd: process.cwd(),
+		detached: true,
+		env: process.env,
+		stdio: "ignore"
+	});
+	child.once("error", (error) => {
+		debugLog("failed to start background uploader:", error);
+		setStatusBestEffort(rolloutFile, {
+			status: "error",
+			error: "failed to start background uploader: " + String(error)
+		});
+	});
+	child.unref();
+}
+/** Persist work before starting a detached uploader, then let Stop return. */
+async function queueAndLaunchUpload(scriptFile$1, rolloutFile, launch = launchUploadWorker) {
+	const stat = await fs.stat(rolloutFile);
+	await queueRollout(rolloutFile, stat.size);
+	await setStatusBestEffort(rolloutFile, {
+		status: "queued",
+		snapshotBytes: stat.size
+	});
+	launch(scriptFile$1, rolloutFile);
+}
+const defaultDependencies = {
+	getConfig,
+	setupInstrumentation,
+	convertRollout
+};
+async function setStatusBestEffort(rolloutFile, status) {
+	try {
+		await writeUploadStatus(rolloutFile, status);
+	} catch (error) {
+		debugLog("failed to write uploader status:", error);
+	}
+}
+/**
+* Upload one stable file snapshot outside the Stop hook's timeout window.
+* Returns the processed snapshot size, or undefined when another worker owns
+* the rollout or tracing is not configured.
+*/
+async function runUploadWorker(rolloutFile, dependencies = defaultDependencies) {
+	if (!rolloutFile) throw new Error("worker rollout path is empty");
+	const lock = await acquireRolloutLock(rolloutFile);
+	if (!lock) return void 0;
+	try {
+		const config$1 = await dependencies.getConfig();
+		setDebug(config$1.debug);
+		if (!config$1.enabled || !config$1.public_key || !config$1.secret_key) {
+			await setStatusBestEffort(rolloutFile, {
+				status: "error",
+				error: "tracing disabled or Langfuse credentials missing"
+			});
+			return;
+		}
+		const snapshotBytes = (await fs.stat(rolloutFile)).size;
+		await setStatusBestEffort(rolloutFile, {
+			status: "uploading",
+			snapshotBytes
+		});
+		const instrumentation = dependencies.setupInstrumentation(config$1);
+		try {
+			const conversion = await dependencies.convertRollout(rolloutFile, {
+				config: config$1,
+				snapshotBytes,
+				deferCommit: true
+			});
+			await instrumentation.shutdown();
+			await conversion.commit();
+			await setStatusBestEffort(rolloutFile, {
+				status: "ok",
+				snapshotBytes,
+				committedOffset: conversion.scan.state.committedOffset,
+				uploadedTurns: conversion.emittedTurns,
+				skippedTurns: conversion.scan.skippedTurns
+			});
+			return snapshotBytes;
+		} catch (error) {
+			await setStatusBestEffort(rolloutFile, {
+				status: "error",
+				error: String(error)
+			});
+			throw error;
+		}
+	} finally {
+		await lock.release();
+	}
+}
+async function runWorkerWithRetry(scriptFile$1, rolloutFile, attempt) {
+	try {
+		const snapshotBytes = await runUploadWorker(rolloutFile);
+		if (snapshotBytes == null) return;
+		if ((await fs.stat(rolloutFile)).size > snapshotBytes) launchUploadWorker(scriptFile$1, rolloutFile);
+	} catch (error) {
+		debugLog("background upload failed:", error);
+		if (attempt >= 2) return;
+		await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1e3 : 5e3));
+		launchUploadWorker(scriptFile$1, rolloutFile, attempt + 1);
 	}
 }
 
 //#endregion
 //#region src/index.ts
 let failOnError = process.env.LANGFUSE_CODEX_FAIL_ON_ERROR === "true";
+const scriptFile = fileURLToPath(import.meta.url);
 /**
 * Entry point for the Codex `Stop` hook.
 *
 * Codex pipes a JSON payload to stdin after every turn. We resolve config,
-* bail out unless tracing is explicitly enabled, then convert the rollout
-* transcript into Langfuse traces.
+* bail out unless tracing is explicitly enabled, durably queue the rollout,
+* and launch a detached uploader. Parsing and network I/O happen outside the
+* Stop hook's timeout window.
 *
 * The hook fails open: any error is logged (in debug mode) and swallowed so a
 * tracing problem never blocks the Codex session. Set
@@ -47451,7 +47897,7 @@ async function runHook() {
 	let hookInput;
 	try {
 		hookInput = await readStdin();
-	} catch (error) {
+	} catch {
 		return;
 	}
 	const config$1 = await getConfig();
@@ -47469,22 +47915,15 @@ async function runHook() {
 		debugLog("hook payload missing transcript_path; skipping");
 		return;
 	}
-	const instrumentation = setupInstrumentation(config$1);
 	try {
-		await convertRollout(hookInput.transcript_path, { config: config$1 });
+		await queueAndLaunchUpload(scriptFile, hookInput.transcript_path);
 	} catch (error) {
-		debugLog("failed to convert rollout:", error);
+		debugLog("failed to queue rollout upload:", error);
 		if (config$1.fail_on_error) throw error;
-	} finally {
-		try {
-			await instrumentation.shutdown();
-		} catch (error) {
-			debugLog("error during flush/shutdown:", error);
-			if (config$1.fail_on_error) throw error;
-		}
 	}
 }
-runHook().catch((error) => {
+const workerArgumentIndex = process.argv.indexOf(WORKER_ARGUMENT);
+(workerArgumentIndex >= 0 ? runWorkerWithRetry(scriptFile, process.argv[workerArgumentIndex + 1] ?? "", Number.parseInt(process.argv[workerArgumentIndex + 2] ?? "0", 10) || 0) : runHook()).catch((error) => {
 	if (process.env.LANGFUSE_CODEX_DEBUG === "true") console.error("[langfuse-codex] fatal:", error);
 	if (failOnError) process.exitCode = 1;
 });

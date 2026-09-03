@@ -6,7 +6,9 @@ Once enabled, every Codex turn shows up in Langfuse as a trace you can inspect, 
 
 ## What gets traced
 
-After each Codex turn, the plugin reads the session's rollout transcript and uploads it to Langfuse as a [trace](https://langfuse.com/docs/observability/data-model). The structure mirrors how Codex actually works:
+After each Codex turn, the Stop hook durably queues the rollout path and returns; a detached,
+per-rollout worker incrementally uploads new transcript bytes to Langfuse as a
+[trace](https://langfuse.com/docs/observability/data-model). The structure mirrors how Codex actually works:
 
 - **Turn** (`Codex Turn`, an [agent observation](https://langfuse.com/docs/observability/features/observation-types)) — one trace per turn, from your prompt to the final answer.
 - **Generations** — one per model response within the turn, named `LLM` (or `LLM Subagent` inside subagent threads), with the model recorded on the observation plus reasoning, assistant text, the tool calls it requested, and token usage.
@@ -146,7 +148,11 @@ Source: [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
 
 ## Deterministic trace ids
 
-By default, trace ids are auto-generated, and an external system (a CI harness, benchmark runner, or dataset-experiment service) that runs `codex exec` headlessly has to poll the Langfuse API to discover the trace a run produced. Set `LANGFUSE_CODEX_TRACE_SEED` (or `trace_seed` in `langfuse.json`) to make trace ids predictable instead:
+By default, trace ids are deterministically derived from the Codex session and turn ids. This makes
+an upload retry target the same top-level trace instead of creating another trace, without making
+ids predictable outside that session. An external system
+(a CI harness, benchmark runner, or dataset-experiment service) can set
+`LANGFUSE_CODEX_TRACE_SEED` (or `trace_seed` in `langfuse.json`) to precompute ids instead:
 
 - **Turn N of the main thread** (1-based, in rollout order) gets the trace id `hex(sha256("<seed>:<N>")).slice(0, 32)`.
 - **Turn N of a subagent thread** gets `hex(sha256("<seed>:<childThreadId>:<N>")).slice(0, 32)`, scoped by the subagent's thread id so it cannot collide with main-thread ids. (Subagent turns spawned _within_ a main-thread turn are nested inside that turn's trace as usual and don't get their own trace id.)
@@ -247,24 +253,27 @@ The default root is `$CODEX_HOME/cctrace/support-context` (or
 - **Authentication fails** — check that the public/secret keys are valid and that `LANGFUSE_BASE_URL` matches the region the keys belong to.
 - **Traces land in the wrong project** — API keys are project-scoped in Langfuse; use the keys for the project you want.
 - **Testing hook failures** — set `LANGFUSE_CODEX_FAIL_ON_ERROR=true` together with `LANGFUSE_CODEX_DEBUG=true` to make Codex report upload or flush errors instead of failing open.
-- **Checking dedup sidecars** — successful uploads of completed turns are recorded next to the rollout as `<rollout>.jsonl.langfuse`. If a Stop hook reads the rollout before Codex has written the turn-completed marker, the trace may upload without a sidecar entry; the next Stop hook will finalize and mark it.
+- **Checking uploader status** — `<rollout>.jsonl.langfuse.status.json` reports `queued`, `uploading`, `ok`, or `error` plus byte offsets and turn counts. It is bounded metadata only and never contains transcript content or credentials.
+- **Checking dedup sidecars** — successfully flushed turn ids remain in the backwards-compatible `<rollout>.jsonl.langfuse` ledger. `<rollout>.jsonl.langfuse.state.json` stores the v2 inode/byte-offset checkpoint. Both are updated only after the Langfuse exporter flush succeeds.
+- **Long or resumed sessions** — the first v2 worker streams a legacy rollout once, skipping JSON parsing for turn ids already in the legacy ledger. Later workers start at the committed byte offset instead of rereading the file.
 - **Verifying in Langfuse** — use `npx langfuse-cli api traces list --from-timestamp <recent ISO> --limit 10 --order-by timestamp.desc --fields core,metrics,observations --json` with credentials for the same project.
 - **Sandboxed/network-restricted runs** — Codex sandbox or network policy can prevent exports from reaching Langfuse. Debug logging and fail-on-error mode are the quickest way to distinguish hook execution from network failure.
 - **Self-hosting** — the TypeScript SDK requires Langfuse platform version >= 3.95.0.
 
 ## Data sent to Langfuse
 
-When enabled, the plugin uploads completed Codex transcript data to Langfuse: prompts, assistant messages, reasoning summaries, tool-call inputs and outputs, model metadata, and token usage. Do not enable tracing for sessions containing data you do not want stored in Langfuse. Use `LANGFUSE_CODEX_MAX_CHARS` to cap how much of large inputs/outputs is captured.
+When enabled, the plugin uploads completed Codex transcript data to Langfuse: prompts, assistant messages, reasoning summaries, tool-call inputs and outputs, model metadata, and token usage. Do not enable tracing for sessions containing data you do not want stored in Langfuse. `LANGFUSE_CODEX_MAX_CHARS` truncates strings while each JSONL event is ingested; a pathological single event larger than the bounded 1–16 MiB line limit is replaced by an omission marker.
 
 ## How it works
 
 Codex emits a [`Stop` hook](https://developers.openai.com/codex) after each turn, passing the path to the session's rollout transcript on stdin. The plugin:
 
-1. Reads the rollout JSONL and reconstructs each turn (model steps, tool calls, usage, subagents).
-2. Converts them into Langfuse observations with the original timestamps, using the [Langfuse TypeScript SDK](https://langfuse.com/docs/observability/sdk/overview) on top of OpenTelemetry.
-3. Records uploaded turn ids in a sidecar file (`<rollout>.langfuse`) so resuming a session does not re-upload completed turns.
+1. Atomically writes pending/status sidecars, starts a detached uploader, and lets Stop return without waiting for transcript parsing or network I/O.
+2. Locks the rollout and streams complete JSONL lines from the last committed v2 byte offset, retaining at most one new turn and skipping already-uploaded legacy turns without parsing their payloads.
+3. Converts new turns into Langfuse observations with original timestamps, using the [Langfuse TypeScript SDK](https://langfuse.com/docs/observability/sdk/overview) on top of OpenTelemetry.
+4. Flushes the exporter, then durably appends turn ids to `<rollout>.langfuse` and atomically advances `<rollout>.langfuse.state.json`.
 
-The hook fails open: any tracing error is logged and swallowed so it never blocks your Codex session.
+The Stop hook remains fail-open. Background failures are retried twice and recorded in the bounded status sidecar, so tracing never blocks the Codex session but is no longer silently unauditable.
 
 ## Development
 

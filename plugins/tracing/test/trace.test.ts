@@ -47,6 +47,7 @@ function stageFixtures(): string {
  */
 const seededTraceId = (seed: string): string =>
   createHash("sha256").update(seed).digest("hex").slice(0, 32);
+const deterministicParentSpanId = "0123456789abcdef";
 
 const attr = (span: ReadableSpan, key: string): string =>
   span.attributes[key] == null ? "" : String(span.attributes[key]);
@@ -80,7 +81,7 @@ describe("convertRollout", () => {
     const root = spans.find((s) => s.name === "Codex Turn");
     expect(root, "expected a 'Codex Turn' root span").toBeDefined();
     expect(obsType(root!)).toBe("agent");
-    expect(parentId(root!)).toBeUndefined(); // top-level turn = its own trace
+    expect(parentId(root!)).toBe(deterministicParentSpanId);
     expect(attr(root!, "langfuse.observation.input")).toContain("List the files");
     expect(attr(root!, "langfuse.observation.output")).toContain("two files");
 
@@ -89,6 +90,7 @@ describe("convertRollout", () => {
     expect(attr(root!, "langfuse.observation.metadata.cctrace.plugin_version")).toBe(
       PLUGIN_VERSION,
     );
+    expect(attr(root!, "langfuse.observation.metadata.cctrace.upload_schema")).toBe("2");
 
     // Two generations, both children of the root, named "LLM" (the model name
     // lives in the model attribute, not the observation name).
@@ -154,7 +156,7 @@ describe("convertRollout", () => {
     const child = spans.find((s) => s.name === "Codex Subagent Turn" && obsType(s) === "agent");
     expect(parent).toBeDefined();
     expect(child).toBeDefined();
-    expect(parentId(parent!)).toBeUndefined();
+    expect(parentId(parent!)).toBe(deterministicParentSpanId);
     expect(parentId(child!)).toBeDefined();
 
     // The subagent turn is nested somewhere under the parent's trace.
@@ -209,6 +211,48 @@ describe("convertRollout", () => {
     exporter.reset();
     await convertRollout(file, { config: baseConfig });
     expect(exporter.getFinishedSpans()).toHaveLength(0);
+  });
+
+  it("defers ledger and offset commits until the caller confirms exporter flush", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+
+    const conversion = await convertRollout(file, {
+      config: baseConfig,
+      deferCommit: true,
+    });
+    expect(conversion.emittedTurns).toBe(1);
+    expect(fs.existsSync(`${file}.langfuse`)).toBe(false);
+    expect(fs.existsSync(`${file}.langfuse.state.json`)).toBe(false);
+
+    await conversion.commit();
+    await conversion.commit(); // idempotent within one worker attempt
+    expect(fs.readFileSync(`${file}.langfuse`, "utf-8")).toBe("turn-1\n");
+    const state = JSON.parse(fs.readFileSync(`${file}.langfuse.state.json`, "utf-8"));
+    expect(state).toMatchObject({
+      version: 2,
+      committedOffset: fs.statSync(file).size,
+      turnNumber: 1,
+    });
+  });
+
+  it("reuses the same trace id when an uncommitted upload is retried", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    const firstTraceId = exporter
+      .getFinishedSpans()
+      .find((span) => span.name === "Codex Turn")!
+      .spanContext().traceId;
+    exporter.reset();
+
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    const retryTraceId = exporter
+      .getFinishedSpans()
+      .find((span) => span.name === "Codex Turn")!
+      .spanContext().traceId;
+    expect(retryTraceId).toBe(firstTraceId);
   });
 
   // Codex fires `Stop` before the just-ended turn's `task_complete` reaches the
@@ -408,19 +452,14 @@ describe("deterministic trace ids (trace_seed)", () => {
     }
   });
 
-  it("leaves trace ids auto-generated when the seed is unset", async () => {
+  it("uses session and turn ids as an idempotency seed when no seed is configured", async () => {
     const dir = stageFixtures();
     await convertRollout(path.join(dir, "rollout-two-turns-main.jsonl"), { config: baseConfig });
 
     const roots = turnRoots();
     expect(roots).toHaveLength(2);
-    for (const root of roots) {
-      // Same shape as before the feature: true root span, random trace id.
-      expect(parentId(root)).toBeUndefined();
-      expect(root.spanContext().traceId).not.toBe(seededTraceId(`${seed}:1`));
-      expect(root.spanContext().traceId).not.toBe(seededTraceId(`${seed}:2`));
-    }
-    expect(roots[0].spanContext().traceId).not.toBe(roots[1].spanContext().traceId);
+    expect(roots[0].spanContext().traceId).toBe(seededTraceId("cctrace:sess-two-turns:turn-a"));
+    expect(roots[1].spanContext().traceId).toBe(seededTraceId("cctrace:sess-two-turns:turn-b"));
   });
 
   it("keeps sidecar dedup working when a seed is set", async () => {

@@ -17,11 +17,16 @@ import {
 } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
-import { parseSession } from "./parse.js";
 import { calculateGpt56Cost, normalizeUsage, reasoningEffort } from "./pricing.js";
-import { loadUploadedTurnIds, markTurnUploaded } from "./sidecar.js";
+import {
+  loadUploadedTurnIds,
+  loadUploadState,
+  markTurnsUploaded,
+  writeUploadState,
+} from "./sidecar.js";
+import { scanRollout, type RolloutScanResult } from "./stream.js";
 import { loadSupportTraceContext } from "./support-context.js";
-import type { ModelStep, RolloutLine, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
+import type { ModelStep, SessionMeta, TokenUsage, ToolCall, Turn } from "./types.js";
 import { debugLog, toText, truncate } from "./utils.js";
 import { PLUGIN_VERSION } from "./version.js";
 
@@ -30,22 +35,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.3.0";
-
-async function loadSession(file: string): Promise<RolloutLine[]> {
-  const data = await fs.readFile(file, "utf-8");
-  const lines: RolloutLine[] = [];
-  for (const raw of data.split("\n")) {
-    const trimmed = raw.trim();
-    if (!trimmed) continue;
-    try {
-      lines.push(JSON.parse(trimmed) as RolloutLine);
-    } catch {
-      // skip malformed lines rather than aborting the whole upload
-    }
-  }
-  return lines;
-}
+const TRACE_PATCH_VERSION = "2.4.0";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
@@ -92,28 +82,31 @@ async function findSubagentRollout(
 const SEED_PARENT_SPAN_ID = "0123456789abcdef";
 
 /**
- * Derive the deterministic trace id for a turn from `config.trace_seed`.
+ * Derive a deterministic trace id for every turn.
  *
  * Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
  * Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
  *
  * The main-thread form deliberately excludes the thread id so external systems
  * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
- * thread exists. Returns `undefined` (auto-generated ids) when no seed is set
- * or derivation fails — the hook must never block an upload.
+ * thread exists. Without an explicit seed, the Codex session and turn ids form
+ * a private stable seed so a retry after an ambiguous exporter failure targets
+ * the same Langfuse trace instead of creating a second top-level trace.
  */
 async function seededTraceParent(
   config: Config,
   sessionMeta: SessionMeta,
   turnNumber: number,
+  turnId?: string,
   supportTraceSeed?: string,
 ): Promise<SpanContext | undefined> {
   const traceSeed = supportTraceSeed ?? config.trace_seed;
-  if (!traceSeed) return undefined;
   try {
-    const seed = sessionMeta.isSubagentThread
-      ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
-      : `${traceSeed}:${turnNumber}`;
+    const seed = traceSeed
+      ? sessionMeta.isSubagentThread
+        ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
+        : `${traceSeed}:${turnNumber}`
+      : `cctrace:${sessionMeta.sessionId}:${turnId ?? turnNumber}`;
     return {
       traceId: await createTraceId(seed),
       spanId: SEED_PARENT_SPAN_ID,
@@ -121,7 +114,7 @@ async function seededTraceParent(
       isRemote: true,
     };
   } catch (error) {
-    debugLog("failed to derive seeded trace id; falling back to auto-generated:", error);
+    debugLog("failed to derive deterministic trace id; falling back to auto-generated:", error);
     if (config.fail_on_error) throw error;
     return undefined;
   }
@@ -210,6 +203,7 @@ async function emitTurn(
         "codex.aborted": turn.aborted,
         "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
         "cctrace.patch": TRACE_PATCH_VERSION,
+        "cctrace.upload_schema": 2,
         "cctrace.plugin_version": PLUGIN_VERSION,
       },
     },
@@ -332,112 +326,130 @@ function emitToolCall(
  * via the Codex thread id). Subagent rollouts are nested under the spawning
  * turn via `parentObservation`.
  */
+export type RolloutConversion = {
+  emittedTurns: number;
+  scan: RolloutScanResult;
+  /** Persist acknowledgements only after the caller has flushed the exporter. */
+  commit: () => Promise<void>;
+};
+
 export async function convertRollout(
   rolloutFile: string,
-  options: { config: Config; parentObservation?: LangfuseObservation },
-): Promise<void> {
-  const { sessionMeta, turns } = parseSession(await loadSession(rolloutFile));
-  debugLog(`parsed ${turns.length} turn(s) from ${path.basename(rolloutFile)}`);
+  options: {
+    config: Config;
+    parentObservation?: LangfuseObservation;
+    snapshotBytes?: number;
+    deferCommit?: boolean;
+  },
+): Promise<RolloutConversion> {
+  const uploaded = options.parentObservation
+    ? new Set<string>()
+    : await loadUploadedTurnIds(rolloutFile);
+  const stat = await fs.stat(rolloutFile);
+  const previousState = options.parentObservation
+    ? undefined
+    : await loadUploadState(rolloutFile, stat);
+  const emittedTurnIds: string[] = [];
+  let emittedTurns = 0;
 
-  // Subagent rollout: nest everything under the parent turn, no dedup/session wrapping.
-  if (options.parentObservation) {
-    for (const turn of turns) {
+  const scan = await scanRollout(rolloutFile, {
+    uploadedTurnIds: uploaded,
+    previousState,
+    snapshotBytes: options.snapshotBytes,
+    maxChars: options.config.max_chars,
+    onTurn: async ({ turn, turnNumber, sessionMeta }) => {
+      // Subagent rollout: nest everything under the parent turn, without a
+      // separate ledger/session wrapper. Its parent turn is itself deduped.
+      if (options.parentObservation) {
+        await emitTurn(turn, sessionMeta, {
+          config: options.config,
+          rolloutFile,
+          parentObservation: options.parentObservation,
+        });
+        emittedTurns++;
+        return;
+      }
+
+      const supportContext = turn.turnId
+        ? await loadSupportTraceContext(
+            options.config.support_context_dir,
+            sessionMeta.sessionId,
+            turn.turnId,
+          )
+        : undefined;
+      const seededParent = await seededTraceParent(
+        options.config,
+        sessionMeta,
+        turnNumber,
+        turn.turnId,
+        supportContext?.trace_seed,
+      );
+      const userId = supportContext?.user_id ?? options.config.user_id;
+      const tags = [
+        ...(options.config.tags ?? []),
+        ...(supportContext
+          ? [
+              "closeclaw-support",
+              `environment:${supportContext.environment}`,
+              `channel:${supportContext.channel}`,
+            ]
+          : []),
+      ].filter((value, index, values) => values.indexOf(value) === index);
+      const metadata: Record<string, string> = {
+        ...(options.config.metadata ?? {}),
+        ...(supportContext
+          ? {
+              "cctrace.context_source": "closeclaw-support-v1",
+              "closeclaw.run_id": supportContext.run_id,
+              "closeclaw.environment": supportContext.environment,
+              "closeclaw.channel": supportContext.channel,
+              "codex.thread_id": sessionMeta.sessionId,
+              ...(turn.turnId ? { "codex.turn_id": turn.turnId } : {}),
+              ...(supportContext.prompt_version
+                ? { "closeclaw.prompt_version": supportContext.prompt_version }
+                : {}),
+            }
+          : {}),
+      };
+
+      const traceAttributes: PropagateAttributesParams = {
+        sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
+        traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
+        ...(userId ? { userId } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      };
       await emitTurn(turn, sessionMeta, {
         config: options.config,
         rolloutFile,
-        parentObservation: options.parentObservation,
+        seededParent,
+        traceAttributes,
       });
-    }
-    return;
+      emittedTurns++;
+      if (turn.turnId) {
+        uploaded.add(turn.turnId);
+        emittedTurnIds.push(turn.turnId);
+      }
+    },
+  });
+
+  debugLog(
+    `scanned ${scan.scannedBytes} byte(s), emitted ${emittedTurns} turn(s) from ${path.basename(rolloutFile)}`,
+  );
+
+  let committed = false;
+  const commit = async () => {
+    if (committed || options.parentObservation) return;
+    // Ledger first: if the following atomic state write fails, a retry rescans
+    // from the old offset but still skips acknowledged turn ids.
+    await markTurnsUploaded(rolloutFile, emittedTurnIds);
+    await writeUploadState(rolloutFile, scan.state);
+    committed = true;
+  };
+
+  if (!options.deferCommit) {
+    await commit();
   }
 
-  const uploaded = await loadUploadedTurnIds(rolloutFile);
-
-  for (let turnIndex = 0; turnIndex < turns.length; turnIndex++) {
-    const turn = turns[turnIndex];
-    if (turn.turnId && uploaded.has(turn.turnId)) {
-      continue; // already uploaded in a previous hook invocation
-    }
-
-    // A turn with nothing in it carries no information: lifecycle events written
-    // after `task_complete` / `turn_aborted` parse into one, as does a turn
-    // aborted before it recorded anything. Codex 0.144 gives those events a turn
-    // id, so a missing id no longer identifies them. Skip before uploading AND
-    // before recording, so a turn that only looks empty because its content has
-    // not been flushed yet is still traced in full on a later Stop.
-    if (
-      turn.userInput == null &&
-      turn.finalOutput == null &&
-      turn.steps.length === 0 &&
-      turn.subagentThreadIds.length === 0
-    ) {
-      continue;
-    }
-
-    // Turn numbering stays 1-based over the full rollout (including turns
-    // skipped by dedup above) so the derived id is stable across hook runs.
-    const supportContext = turn.turnId
-      ? await loadSupportTraceContext(
-          options.config.support_context_dir,
-          sessionMeta.sessionId,
-          turn.turnId,
-        )
-      : undefined;
-    const seededParent = await seededTraceParent(
-      options.config,
-      sessionMeta,
-      turnIndex + 1,
-      supportContext?.trace_seed,
-    );
-    const userId = supportContext?.user_id ?? options.config.user_id;
-    const tags = [
-      ...(options.config.tags ?? []),
-      ...(supportContext
-        ? [
-            "closeclaw-support",
-            `environment:${supportContext.environment}`,
-            `channel:${supportContext.channel}`,
-          ]
-        : []),
-    ].filter((value, index, values) => values.indexOf(value) === index);
-    const metadata: Record<string, string> = {
-      ...(options.config.metadata ?? {}),
-      ...(supportContext
-        ? {
-            "cctrace.context_source": "closeclaw-support-v1",
-            "closeclaw.run_id": supportContext.run_id,
-            "closeclaw.environment": supportContext.environment,
-            "closeclaw.channel": supportContext.channel,
-            "codex.thread_id": sessionMeta.sessionId,
-            ...(turn.turnId ? { "codex.turn_id": turn.turnId } : {}),
-            ...(supportContext.prompt_version
-              ? { "closeclaw.prompt_version": supportContext.prompt_version }
-              : {}),
-          }
-        : {}),
-    };
-
-    const traceAttributes: PropagateAttributesParams = {
-      sessionId: supportContext?.session_id ?? sessionMeta.sessionId,
-      traceName: sessionMeta.isSubagentThread ? "Codex Subagent Turn" : "Codex Turn",
-      ...(userId ? { userId } : {}),
-      ...(tags.length > 0 ? { tags } : {}),
-      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-    };
-    await emitTurn(turn, sessionMeta, {
-      config: options.config,
-      rolloutFile,
-      seededParent,
-      traceAttributes,
-    });
-
-    // Record every turn we upload, completed or not. Codex fires `Stop` before
-    // the just-ended turn's `task_complete` reaches the rollout, so waiting for
-    // `completed` before recording means the next Stop sees an unrecorded turn
-    // and uploads it again — as a new trace, not an update.
-    if (turn.turnId) {
-      uploaded.add(turn.turnId);
-      await markTurnUploaded(rolloutFile, turn.turnId);
-    }
-  }
+  return { emittedTurns, scan, commit };
 }
