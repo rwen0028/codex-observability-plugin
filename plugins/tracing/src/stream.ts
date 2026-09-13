@@ -1,12 +1,13 @@
 import * as fs from "node:fs/promises";
 
 import { parseSession } from "./parse.js";
+import { reasoningRecord } from "./reasoning.js";
 import { rolloutIdentity, type UploadState } from "./sidecar.js";
 import type { RolloutLine, SessionMeta, Turn } from "./types.js";
 
 const READ_BUFFER_BYTES = 64 * 1024;
-export const MIN_MAX_LINE_BYTES = 1024 * 1024;
 export const MAX_MAX_LINE_BYTES = 16 * 1024 * 1024;
+export const MAX_RETAINED_TURN_BYTES = 16 * 1024 * 1024;
 
 export type StreamedTurn = {
   turn: Turn;
@@ -29,13 +30,10 @@ type ActiveTurn = {
   completed: boolean;
   finalOutputSeen: boolean;
   lines: RolloutLine[];
+  retainedBytes: number;
   lastTimestamp: string;
   startOffset: number;
 };
-
-function maxLineBytes(maxChars: number): number {
-  return Math.max(MIN_MAX_LINE_BYTES, Math.min(MAX_MAX_LINE_BYTES, maxChars * 8));
-}
 
 /** Truncate strings before parsed events are retained in a turn-sized buffer. */
 function truncateStrings(value: unknown, maxChars: number): void {
@@ -78,7 +76,7 @@ function parseLine(raw: string, maxChars: number): RolloutLine | undefined {
   try {
     const line = JSON.parse(trimmed) as RolloutLine;
     if (line == null || typeof line !== "object") return undefined;
-    truncateStrings(line, maxChars);
+    if (!reasoningRecord(line)) truncateStrings(line, maxChars);
     return line;
   } catch {
     return undefined;
@@ -93,7 +91,8 @@ function isTaskComplete(line: RolloutLine): boolean {
 }
 
 function isFinalOutputLine(line: RolloutLine): boolean {
-  const payload = line.payload as { type?: string; role?: string };
+  const payload = line.payload as { type?: string; role?: string; channel?: string };
+  if (payload.channel === "analysis") return false;
   return (
     (line.type === "event_msg" && payload.type === "agent_message") ||
     (line.type === "response_item" && payload.type === "message" && payload.role === "assistant")
@@ -222,7 +221,6 @@ export async function scanRollout(
   let turnNumber = options.previousState?.turnNumber ?? 0;
   let active: ActiveTurn | undefined;
   let skippedTurns = 0;
-  let oversizedLines = 0;
   let resumeOffset: number | undefined;
   let resumeTurnNumber: number | undefined;
 
@@ -251,21 +249,13 @@ export async function scanRollout(
     rolloutFile,
     startOffset,
     snapshotBytes,
-    maxLineBytes(options.maxChars),
+    MAX_MAX_LINE_BYTES,
     async ({ raw, bytes, endOffset }) => {
       if (raw == null) {
-        oversizedLines++;
-        if (active && !active.skipped) {
-          active.lines.push({
-            timestamp: active.lastTimestamp,
-            type: "event_msg",
-            payload: {
-              type: "agent_message",
-              message: `[rollout event omitted: ${bytes} bytes exceeds safety limit]`,
-            },
-          });
-        }
-        return;
+        if (active?.skipped) return;
+        throw new Error(
+          `Rollout event exceeds safety limit: ${bytes} bytes (limit ${MAX_MAX_LINE_BYTES})`,
+        );
       }
 
       // While skipping an already-uploaded turn, nearly every line can avoid
@@ -290,6 +280,7 @@ export async function scanRollout(
           turnNumber,
           skipped: turnId != null && options.uploadedTurnIds.has(turnId),
           lines: [],
+          retainedBytes: bytes,
           completed: false,
           finalOutputSeen: false,
           lastTimestamp: line.timestamp,
@@ -300,6 +291,12 @@ export async function scanRollout(
       }
 
       if (active && !active.skipped) {
+        active.retainedBytes += Buffer.byteLength(JSON.stringify(line));
+        if (active.retainedBytes > MAX_RETAINED_TURN_BYTES) {
+          throw new Error(
+            `Retained rollout turn exceeds safety limit: ${active.retainedBytes} bytes (limit ${MAX_RETAINED_TURN_BYTES})`,
+          );
+        }
         active.lastTimestamp = line.timestamp;
         if (isTaskComplete(line)) active.completed = true;
         if (isFinalOutputLine(line)) active.finalOutputSeen = true;
@@ -322,6 +319,6 @@ export async function scanRollout(
     snapshotBytes,
     scannedBytes: snapshotBytes - startOffset,
     skippedTurns,
-    oversizedLines,
+    oversizedLines: 0,
   };
 }

@@ -18,6 +18,20 @@ per-rollout worker incrementally uploads new transcript bytes to Langfuse as a
 
 Interrupted turns (where you cancel mid-response) are still uploaded and flagged as interrupted.
 
+## Reasoning records
+
+Select an `LLM` or `LLM Subagent` observation, then open its Output JSON:
+
+- `reasoning` is a readable preview. Nonempty content takes precedence over summaries; empty content falls back to summary text. Mirrored lifecycle events are suppressed in the preview within the same model step.
+- `reasoning_items` is the untruncated archive of the reasoning records present in the rollout, in source order. Each entry contains `source`, `timestamp`, and the original `payload`, including item ids, summaries, content, and `encrypted_content` when supplied.
+- Event-only reasoning and assistant messages with `channel: "analysis"` are captured here, not as the final answer. Mirrored records remain in the archive for provenance; they do not create additional billed model steps.
+
+`max_chars` controls display previews and ordinary inputs/tool outputs, not `reasoning_items`. Encrypted content is stored unchanged, not decrypted or converted into readable thoughts. The plugin cannot recover reasoning that Codex never wrote to the rollout. This is a reasoning archive, not an unabridged export of every input and tool result.
+
+The uploader keeps the 64 KiB streaming reader and per-rollout background worker. It waits for the SDK to flush each turn before processing the next, keeping full archives out of a backlog-sized export queue. Records exceeding 16 MiB, or turns exceeding 16 MiB of retained JSON after ordinary display truncation, fail explicitly instead of silently dropping data and acknowledging a complete upload. Pending data is preflighted before export to avoid emitting earlier turns repeatedly on a deterministic size failure. Check `.langfuse.status.json` for errors; do not clear upload ledgers to replay history. These are client safety limits, not a guarantee that every Langfuse deployment accepts payloads of that size.
+
+Only new, unacknowledged turns use the new capture logic. Historical backfill requires the original rollout and a separate migration targeting existing observation ids. The parser does not change credentials, project routing, token accounting, or service configuration.
+
 ## Prerequisites
 
 - Node.js >= 22

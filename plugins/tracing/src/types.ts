@@ -192,10 +192,17 @@ export type ToolCall = {
 };
 
 /** A single model response within a turn (one LLM call). */
+export type ReasoningRecord = {
+  source: "response_item" | "event_msg";
+  timestamp: string;
+  payload: Record<string, unknown>;
+};
+
 export type ModelStep = {
   startTime: number;
   endTime: number;
   reasoning?: string;
+  reasoningItems?: ReasoningRecord[];
   text?: string;
   toolCalls: ToolCall[];
   usage?: TokenUsage;

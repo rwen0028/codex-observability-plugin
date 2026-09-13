@@ -35,7 +35,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.4.1";
+const TRACE_PATCH_VERSION = "2.4.2";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
@@ -143,6 +143,7 @@ function buildGenerationOutput(step: ModelStep, clip: Clip): Record<string, unkn
   const output: Record<string, unknown> = {};
   if (step.text) output.content = clip(step.text);
   if (step.reasoning) output.reasoning = clip(step.reasoning);
+  if (step.reasoningItems?.length) output.reasoning_items = step.reasoningItems;
   if (step.toolCalls.length > 0) {
     output.tool_calls = step.toolCalls.map((tc) => ({
       id: tc.callId,
@@ -172,6 +173,7 @@ async function emitTurn(
   ctx: {
     config: Config;
     rolloutFile: string;
+    flush?: () => Promise<void>;
     parentObservation?: LangfuseObservation;
     /** Pre-derived trace id for top-level turns (see seededTraceParent). */
     seededParent?: SpanContext;
@@ -247,6 +249,7 @@ async function emitTurn(
         costDetails: pricing?.costDetails,
         metadata: {
           "codex.step_index": i,
+          "cctrace.reasoning_schema": 1,
           ...(effort ? { "codex.reasoning_effort": effort } : {}),
           ...(pricing
             ? {
@@ -288,7 +291,11 @@ async function emitTurn(
       debugLog(`subagent rollout not found for thread ${threadId}`);
       continue;
     }
-    await convertRollout(subFile, { config: ctx.config, parentObservation: root });
+    await convertRollout(subFile, {
+      config: ctx.config,
+      parentObservation: root,
+      flush: ctx.flush,
+    });
   }
 
   root.end(new Date(turn.endTime));
@@ -339,6 +346,7 @@ export async function convertRollout(
     parentObservation?: LangfuseObservation;
     snapshotBytes?: number;
     deferCommit?: boolean;
+    flush?: () => Promise<void>;
   },
 ): Promise<RolloutConversion> {
   const uploaded = options.parentObservation
@@ -351,10 +359,21 @@ export async function convertRollout(
   const emittedTurnIds: string[] = [];
   let emittedTurns = 0;
 
+  const snapshotBytes = Math.min(options.snapshotBytes ?? stat.size, stat.size);
+  // Validate all pending turns before exporting any: deterministic size failures
+  // must not cause earlier successful turns to be emitted again on each retry.
+  await scanRollout(rolloutFile, {
+    uploadedTurnIds: uploaded,
+    previousState,
+    snapshotBytes,
+    maxChars: options.config.max_chars,
+    onTurn: async () => {},
+  });
+
   const scan = await scanRollout(rolloutFile, {
     uploadedTurnIds: uploaded,
     previousState,
-    snapshotBytes: options.snapshotBytes,
+    snapshotBytes,
     maxChars: options.config.max_chars,
     onTurn: async ({ turn, turnNumber, sessionMeta }) => {
       // Subagent rollout: nest everything under the parent turn, without a
@@ -364,7 +383,9 @@ export async function convertRollout(
           config: options.config,
           rolloutFile,
           parentObservation: options.parentObservation,
+          flush: options.flush,
         });
+        await options.flush?.();
         emittedTurns++;
         return;
       }
@@ -423,8 +444,10 @@ export async function convertRollout(
           rolloutFile,
           seededParent,
           traceAttributes,
+          flush: options.flush,
         });
       });
+      await options.flush?.();
       emittedTurns++;
       if (turn.turnId) {
         uploaded.add(turn.turnId);

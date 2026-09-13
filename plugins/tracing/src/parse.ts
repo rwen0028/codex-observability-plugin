@@ -14,7 +14,8 @@ import type {
   ToolCall,
   Turn,
 } from "./types.js";
-import { isPrimitive, toText } from "./utils.js";
+import { isPrimitive } from "./utils.js";
+import { reasoningRecord, reasoningText } from "./reasoning.js";
 
 /** Extract printable text from a Codex message `content` array. */
 function extractMessageText(content: MessageContentPart[] | undefined): string {
@@ -29,31 +30,6 @@ function extractMessageText(content: MessageContentPart[] | undefined): string {
     })
     .filter(Boolean)
     .join("\n");
-}
-
-/** Extract reasoning text, skipping encrypted-only reasoning items. */
-function extractReasoning(item: {
-  content?: unknown[] | string | null;
-  summary?: unknown[];
-}): string {
-  if (typeof item.content === "string") return item.content;
-  if (Array.isArray(item.content)) {
-    return item.content
-      .map((c) =>
-        c && typeof c === "object" && "text" in c
-          ? toText((c as { text: unknown }).text)
-          : toText(c),
-      )
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (Array.isArray(item.summary) && item.summary.length > 0) {
-    return item.summary
-      .map((s) => toText(s))
-      .filter(Boolean)
-      .join("\n");
-  }
-  return "";
 }
 
 function parseArgs(raw: string): unknown {
@@ -129,6 +105,7 @@ export function parseSession(lines: RolloutLine[]): {
     if (!step) return;
     step.endTime = Math.max(step.endTime, ts);
     if (usage) step.usage = usage;
+    if (step.reasoningItems) step.reasoning = reasoningText(step.reasoningItems);
     turn!.steps.push(step);
     step = null;
   };
@@ -178,6 +155,14 @@ export function parseSession(lines: RolloutLine[]): {
       const p = line.payload as { model?: string };
       t.model = p.model ?? t.model;
       t.invocationParams = line.payload as Record<string, unknown>;
+      continue;
+    }
+
+    const record = reasoningRecord(line);
+    if (record) {
+      ensureTurn(ts);
+      const s = ensureStep(ts);
+      (s.reasoningItems ??= []).push(record);
       continue;
     }
 
@@ -267,14 +252,6 @@ export function parseSession(lines: RolloutLine[]): {
         if (tc) {
           if (tc.output == null) tc.output = out.output;
           tc.endTime = Math.max(tc.endTime ?? ts, ts);
-        }
-      } else if (p.type === "reasoning") {
-        const reasoning = extractReasoning(
-          p as { content?: unknown[] | string | null; summary?: unknown[] },
-        );
-        if (reasoning) {
-          const s = ensureStep(ts);
-          s.reasoning = s.reasoning ? `${s.reasoning}\n${reasoning}` : reasoning;
         }
       }
       continue;

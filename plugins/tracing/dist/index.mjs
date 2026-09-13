@@ -46208,10 +46208,9 @@ var import_src = require_src();
 * instrumentation loading. Registering the provider also installs the
 * AsyncLocalStorage context manager that `propagateAttributes` relies on.
 *
-* We use `exportMode: "batched"` and flush once at the end: the whole rollout
-* is converted in-process, so batching every span into one (or a few) requests
-* is far faster than one request per span — important for the hook's timeout
-* budget. `shutdown()` below calls `forceFlush()` before the process exits.
+* Spans are batched within each turn. The worker awaits a flush between turns
+* so full reasoning archives cannot accumulate across a large upload backlog.
+* `shutdown()` also flushes before the process exits.
 */
 function setupInstrumentation(config$1) {
 	const spanProcessor = new LangfuseSpanProcessor({
@@ -46224,10 +46223,13 @@ function setupInstrumentation(config$1) {
 	});
 	const provider = new import_src.NodeTracerProvider({ spanProcessors: [spanProcessor] });
 	provider.register();
-	return { shutdown: async () => {
-		await spanProcessor.forceFlush();
-		await provider.shutdown();
-	} };
+	return {
+		flush: () => spanProcessor.forceFlush(),
+		shutdown: async () => {
+			await spanProcessor.forceFlush();
+			await provider.shutdown();
+		}
+	};
 }
 
 //#endregion
@@ -46946,6 +46948,63 @@ function reasoningEffort(turn) {
 }
 
 //#endregion
+//#region src/reasoning.ts
+function reasoningRecord(line) {
+	const payload = line.payload;
+	if (!payload || typeof payload !== "object") return void 0;
+	const isAnalysis = payload.channel === "analysis";
+	if (line.type === "response_item" && (payload.type === "reasoning" || payload.type === "message" && payload.role === "assistant" && isAnalysis) || line.type === "event_msg" && (payload.type === "agent_reasoning" || payload.type === "agent_reasoning_raw_content" || payload.type === "agent_message" && isAnalysis)) return {
+		source: line.type,
+		timestamp: line.timestamp,
+		payload
+	};
+}
+function textParts(value) {
+	if (typeof value === "string") return value ? [value] : [];
+	if (!Array.isArray(value)) return [];
+	return value.flatMap((part) => {
+		if (typeof part === "string") return part ? [part] : [];
+		if (part && typeof part === "object" && "text" in part && typeof part.text === "string") return part.text ? [part.text] : [];
+		return [];
+	});
+}
+function reasoningText(records) {
+	const mirrors = /* @__PURE__ */ new Map();
+	const seenItems = /* @__PURE__ */ new Map();
+	const canonical = records.map((record$1) => {
+		if (record$1.source !== "response_item") return void 0;
+		const { payload } = record$1;
+		const content = textParts(payload.content);
+		const summary = textParts(payload.summary);
+		const text = (content.length > 0 ? content : summary).join("\n");
+		if (typeof payload.id === "string") {
+			const key = JSON.stringify([payload.content, payload.summary]);
+			if (seenItems.get(payload.id) === key) return "";
+			seenItems.set(payload.id, key);
+		}
+		for (const parts of [content, summary]) {
+			for (const part of parts) mirrors.set(part, (mirrors.get(part) ?? 0) + 1);
+			if (parts.length > 1) {
+				const joined = parts.join("\n");
+				mirrors.set(joined, (mirrors.get(joined) ?? 0) + 1);
+			}
+		}
+		return text;
+	});
+	return records.map((record$1, index) => {
+		if (canonical[index] !== void 0) return canonical[index];
+		const { payload } = record$1;
+		const text = textParts(payload.text ?? payload.message ?? payload.content).join("\n");
+		const count = mirrors.get(text) ?? 0;
+		if (count > 0) {
+			mirrors.set(text, count - 1);
+			return "";
+		}
+		return text;
+	}).filter(Boolean).join("\n") || void 0;
+}
+
+//#endregion
 //#region src/parse.ts
 /** Extract printable text from a Codex message `content` array. */
 function extractMessageText(content) {
@@ -46955,13 +47014,6 @@ function extractMessageText(content) {
 		if (part.type === "input_text" || part.type === "output_text" || part.type === "text") return typeof part.text === "string" ? part.text : "";
 		return "";
 	}).filter(Boolean).join("\n");
-}
-/** Extract reasoning text, skipping encrypted-only reasoning items. */
-function extractReasoning(item) {
-	if (typeof item.content === "string") return item.content;
-	if (Array.isArray(item.content)) return item.content.map((c) => c && typeof c === "object" && "text" in c ? toText(c.text) : toText(c)).filter(Boolean).join("\n");
-	if (Array.isArray(item.summary) && item.summary.length > 0) return item.summary.map((s) => toText(s)).filter(Boolean).join("\n");
-	return "";
 }
 function parseArgs(raw) {
 	if (typeof raw !== "string") return raw;
@@ -47020,6 +47072,7 @@ function parseSession(lines) {
 		if (!step) return;
 		step.endTime = Math.max(step.endTime, ts);
 		if (usage) step.usage = usage;
+		if (step.reasoningItems) step.reasoning = reasoningText(step.reasoningItems);
 		turn.steps.push(step);
 		step = null;
 	};
@@ -47055,6 +47108,13 @@ function parseSession(lines) {
 			const t = ensureTurn(ts);
 			t.model = line.payload.model ?? t.model;
 			t.invocationParams = line.payload;
+			continue;
+		}
+		const record$1 = reasoningRecord(line);
+		if (record$1) {
+			ensureTurn(ts);
+			const s = ensureStep(ts);
+			(s.reasoningItems ??= []).push(record$1);
 			continue;
 		}
 		if (line.type === "response_item") {
@@ -47126,12 +47186,6 @@ function parseSession(lines) {
 				if (tc) {
 					if (tc.output == null) tc.output = out.output;
 					tc.endTime = Math.max(tc.endTime ?? ts, ts);
-				}
-			} else if (p.type === "reasoning") {
-				const reasoning = extractReasoning(p);
-				if (reasoning) {
-					const s = ensureStep(ts);
-					s.reasoning = s.reasoning ? `${s.reasoning}\n${reasoning}` : reasoning;
 				}
 			}
 			continue;
@@ -47212,11 +47266,8 @@ function parseSession(lines) {
 //#endregion
 //#region src/stream.ts
 const READ_BUFFER_BYTES = 64 * 1024;
-const MIN_MAX_LINE_BYTES = 1024 * 1024;
 const MAX_MAX_LINE_BYTES = 16 * 1024 * 1024;
-function maxLineBytes(maxChars) {
-	return Math.max(MIN_MAX_LINE_BYTES, Math.min(MAX_MAX_LINE_BYTES, maxChars * 8));
-}
+const MAX_RETAINED_TURN_BYTES = 16 * 1024 * 1024;
 /** Truncate strings before parsed events are retained in a turn-sized buffer. */
 function truncateStrings(value, maxChars) {
 	if (value == null || typeof value !== "object") return;
@@ -47244,7 +47295,7 @@ function parseLine(raw, maxChars) {
 	try {
 		const line = JSON.parse(trimmed);
 		if (line == null || typeof line !== "object") return void 0;
-		truncateStrings(line, maxChars);
+		if (!reasoningRecord(line)) truncateStrings(line, maxChars);
 		return line;
 	} catch {
 		return;
@@ -47258,6 +47309,7 @@ function isTaskComplete(line) {
 }
 function isFinalOutputLine(line) {
 	const payload = line.payload;
+	if (payload.channel === "analysis") return false;
 	return line.type === "event_msg" && payload.type === "agent_message" || line.type === "response_item" && payload.type === "message" && payload.role === "assistant";
 }
 function updateSessionMeta(current, line) {
@@ -47344,7 +47396,6 @@ async function scanRollout(rolloutFile, options) {
 	let turnNumber = options.previousState?.turnNumber ?? 0;
 	let active;
 	let skippedTurns = 0;
-	let oversizedLines = 0;
 	let resumeOffset;
 	let resumeTurnNumber;
 	const finishActive = async (trailing) => {
@@ -47367,18 +47418,10 @@ async function scanRollout(rolloutFile, options) {
 			resumeTurnNumber = current.turnNumber - 1;
 		}
 	};
-	const committedOffset = await scanCompleteLines(rolloutFile, startOffset, snapshotBytes, maxLineBytes(options.maxChars), async ({ raw, bytes, endOffset }) => {
+	const committedOffset = await scanCompleteLines(rolloutFile, startOffset, snapshotBytes, MAX_MAX_LINE_BYTES, async ({ raw, bytes, endOffset }) => {
 		if (raw == null) {
-			oversizedLines++;
-			if (active && !active.skipped) active.lines.push({
-				timestamp: active.lastTimestamp,
-				type: "event_msg",
-				payload: {
-					type: "agent_message",
-					message: `[rollout event omitted: ${bytes} bytes exceeds safety limit]`
-				}
-			});
-			return;
+			if (active?.skipped) return;
+			throw new Error(`Rollout event exceeds safety limit: ${bytes} bytes (limit ${MAX_MAX_LINE_BYTES})`);
 		}
 		if (active?.skipped && !raw.includes("task_started") && !raw.includes("session_meta")) return;
 		if (!active && !raw.includes("task_started") && !raw.includes("session_meta")) return;
@@ -47396,6 +47439,7 @@ async function scanRollout(rolloutFile, options) {
 				turnNumber,
 				skipped: turnId != null && options.uploadedTurnIds.has(turnId),
 				lines: [],
+				retainedBytes: bytes,
 				completed: false,
 				finalOutputSeen: false,
 				lastTimestamp: line.timestamp,
@@ -47405,6 +47449,8 @@ async function scanRollout(rolloutFile, options) {
 			return;
 		}
 		if (active && !active.skipped) {
+			active.retainedBytes += Buffer.byteLength(JSON.stringify(line));
+			if (active.retainedBytes > MAX_RETAINED_TURN_BYTES) throw new Error(`Retained rollout turn exceeds safety limit: ${active.retainedBytes} bytes (limit ${MAX_RETAINED_TURN_BYTES})`);
 			active.lastTimestamp = line.timestamp;
 			if (isTaskComplete(line)) active.completed = true;
 			if (isFinalOutputLine(line)) active.finalOutputSeen = true;
@@ -47424,7 +47470,7 @@ async function scanRollout(rolloutFile, options) {
 		snapshotBytes,
 		scannedBytes: snapshotBytes - startOffset,
 		skippedTurns,
-		oversizedLines
+		oversizedLines: 0
 	};
 }
 
@@ -47498,7 +47544,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.4.1";
+const TRACE_PATCH_VERSION = "2.4.2";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *
@@ -47577,6 +47623,7 @@ function buildGenerationOutput(step, clip) {
 	const output = {};
 	if (step.text) output.content = clip(step.text);
 	if (step.reasoning) output.reasoning = clip(step.reasoning);
+	if (step.reasoningItems?.length) output.reasoning_items = step.reasoningItems;
 	if (step.toolCalls.length > 0) output.tool_calls = step.toolCalls.map((tc) => ({
 		id: tc.callId,
 		name: tc.name,
@@ -47639,6 +47686,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			costDetails: pricing?.costDetails,
 			metadata: {
 				"codex.step_index": i,
+				"cctrace.reasoning_schema": 1,
 				...effort ? { "codex.reasoning_effort": effort } : {},
 				...pricing ? {
 					"cctrace.pricing_source": "openai-official-2026-07-09",
@@ -47668,7 +47716,8 @@ async function emitTurn(turn, sessionMeta, ctx) {
 		}
 		await convertRollout(subFile, {
 			config: ctx.config,
-			parentObservation: root
+			parentObservation: root,
+			flush: ctx.flush
 		});
 	}
 	root.end(new Date(turn.endTime));
@@ -47695,18 +47744,28 @@ async function convertRollout(rolloutFile, options) {
 	const previousState = options.parentObservation ? void 0 : await loadUploadState(rolloutFile, stat);
 	const emittedTurnIds = [];
 	let emittedTurns = 0;
+	const snapshotBytes = Math.min(options.snapshotBytes ?? stat.size, stat.size);
+	await scanRollout(rolloutFile, {
+		uploadedTurnIds: uploaded,
+		previousState,
+		snapshotBytes,
+		maxChars: options.config.max_chars,
+		onTurn: async () => {}
+	});
 	const scan = await scanRollout(rolloutFile, {
 		uploadedTurnIds: uploaded,
 		previousState,
-		snapshotBytes: options.snapshotBytes,
+		snapshotBytes,
 		maxChars: options.config.max_chars,
 		onTurn: async ({ turn, turnNumber, sessionMeta }) => {
 			if (options.parentObservation) {
 				await emitTurn(turn, sessionMeta, {
 					config: options.config,
 					rolloutFile,
-					parentObservation: options.parentObservation
+					parentObservation: options.parentObservation,
+					flush: options.flush
 				});
+				await options.flush?.();
 				emittedTurns++;
 				return;
 			}
@@ -47742,9 +47801,11 @@ async function convertRollout(rolloutFile, options) {
 					config: options.config,
 					rolloutFile,
 					seededParent,
-					traceAttributes
+					traceAttributes,
+					flush: options.flush
 				});
 			});
+			await options.flush?.();
 			emittedTurns++;
 			if (turn.turnId) {
 				uploaded.add(turn.turnId);
@@ -47843,7 +47904,8 @@ async function runUploadWorker(rolloutFile, dependencies = defaultDependencies) 
 			const conversion = await dependencies.convertRollout(rolloutFile, {
 				config: config$1,
 				snapshotBytes,
-				deferCommit: true
+				deferCommit: true,
+				flush: instrumentation.flush
 			});
 			await instrumentation.shutdown();
 			await conversion.commit();

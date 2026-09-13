@@ -40,6 +40,9 @@ function dependenciesFor(
   return {
     getConfig: async () => config,
     setupInstrumentation: () => ({
+      flush: async () => {
+        order.push("flush-turn");
+      },
       shutdown: async () => {
         order.push("flush");
         if (options?.flushError) throw options.flushError;

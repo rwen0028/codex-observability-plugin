@@ -4,8 +4,8 @@ import * as path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { scanRollout } from "../src/stream.js";
-import type { RolloutLine } from "../src/types.js";
+import { MAX_MAX_LINE_BYTES, MAX_RETAINED_TURN_BYTES, scanRollout } from "../src/stream.js";
+import type { RolloutLine, Turn } from "../src/types.js";
 
 const tmpDirs: string[] = [];
 
@@ -182,46 +182,131 @@ describe("scanRollout", () => {
     expect(second.state.committedOffset).toBe(fs.statSync(file).size);
   });
 
-  it("bounds a pathological event and revisits it until the turn completes", async () => {
+  it("preserves long reasoning records independently of the display limit", async () => {
     const file = makeRollout();
     const [start, user, , complete] = turnLines(1);
-    const hugeOutput: RolloutLine = {
-      timestamp: "2026-09-03T00:00:01.000Z",
+    const payload = {
+      type: "reasoning",
+      id: "long-reasoning",
+      content: [],
+      summary: [{ type: "summary_text", text: "思考".repeat(20_001) }],
+      encrypted_content: "opaque".repeat(30_000),
+    };
+    fs.writeFileSync(
+      file,
+      encode([
+        sessionLine(),
+        start,
+        user,
+        {
+          timestamp: start.timestamp,
+          type: "response_item",
+          payload,
+        },
+        complete,
+      ]),
+    );
+    const turns: Turn[] = [];
+    await scanRollout(file, {
+      uploadedTurnIds: new Set(),
+      maxChars: 100,
+      onTurn: async ({ turn }) => {
+        turns.push(turn);
+      },
+    });
+    expect(turns[0].steps[0].reasoning).toBe(payload.summary[0].text);
+    expect(turns[0].steps[0].reasoningItems?.[0].payload).toEqual(payload);
+  });
+
+  it("does not mistake a trailing analysis message for the final answer", async () => {
+    const file = makeRollout();
+    const [start, user, , complete] = turnLines(1);
+    fs.writeFileSync(
+      file,
+      encode([
+        sessionLine(),
+        start,
+        user,
+        {
+          timestamp: start.timestamp,
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            channel: "analysis",
+            content: [{ type: "output_text", text: "still thinking" }],
+          },
+        },
+      ]),
+    );
+    const turns: Turn[] = [];
+    const first = await scanRollout(file, {
+      uploadedTurnIds: new Set(),
+      maxChars: 20_000,
+      onTurn: async ({ turn }) => {
+        turns.push(turn);
+      },
+    });
+    expect(turns).toEqual([]);
+    expect(first.state.committedOffset).toBe(Buffer.byteLength(encode([sessionLine()])));
+    fs.appendFileSync(file, encode([complete]));
+    await scanRollout(file, {
+      uploadedTurnIds: new Set(),
+      previousState: first.state,
+      maxChars: 20_000,
+      onTurn: async ({ turn }) => {
+        turns.push(turn);
+      },
+    });
+    expect(turns[0].steps[0].reasoning).toBe("still thinking");
+    expect(turns[0].finalOutput).toBeUndefined();
+  });
+
+  it("fails explicitly on oversized unuploaded records instead of claiming a complete archive", async () => {
+    const file = makeRollout();
+    const [start, user, , complete] = turnLines(1);
+    const large = {
+      timestamp: start.timestamp,
       type: "response_item",
       payload: {
-        type: "function_call_output",
-        call_id: "call-huge",
-        output: "x".repeat(2 * 1024 * 1024),
+        type: "reasoning",
+        encrypted_content: "x".repeat(MAX_MAX_LINE_BYTES),
       },
     };
-    fs.writeFileSync(file, encode([sessionLine(), start, user, hugeOutput]));
-
-    const turns: string[] = [];
-    const result = await scanRollout(file, {
-      uploadedTurnIds: new Set(),
+    fs.writeFileSync(file, encode([sessionLine(), start, user, large, complete]));
+    const turns: Turn[] = [];
+    const options = {
+      uploadedTurnIds: new Set<string>(),
       maxChars: 100,
-      onTurn: async ({ turn }) => {
-        turns.push(turn.turnId!);
+      onTurn: async ({ turn }: { turn: Turn }) => {
+        turns.push(turn);
       },
-    });
-
+    };
+    await expect(scanRollout(file, options)).rejects.toThrow("Rollout event exceeds safety limit");
     expect(turns).toEqual([]);
-    expect(result.oversizedLines).toBe(1);
-    expect(result.state.committedOffset).toBe(Buffer.byteLength(encode([sessionLine()])));
+    const skipped = await scanRollout(file, { ...options, uploadedTurnIds: new Set(["turn-1"]) });
+    expect(skipped.skippedTurns).toBe(1);
+    expect(skipped.state.committedOffset).toBe(fs.statSync(file).size);
+  });
 
-    fs.appendFileSync(file, encode([complete]));
-    const retried: string[] = [];
-    const second = await scanRollout(file, {
-      uploadedTurnIds: new Set(),
-      previousState: result.state,
-      maxChars: 100,
-      onTurn: async ({ turn }) => {
-        retried.push(turn.turnId!);
+  it("bounds retained data across many reasoning records in one turn", async () => {
+    const file = makeRollout();
+    const [start, , , complete] = turnLines(1);
+    const item: RolloutLine = {
+      timestamp: start.timestamp,
+      type: "response_item",
+      payload: {
+        type: "reasoning",
+        encrypted_content: "x".repeat(MAX_RETAINED_TURN_BYTES / 4),
       },
-    });
-
-    expect(retried).toEqual(["turn-1"]);
-    expect(second.oversizedLines).toBe(1);
-    expect(second.state.committedOffset).toBe(fs.statSync(file).size);
+    };
+    fs.writeFileSync(file, encode([sessionLine(), start, item, item, item, item, complete]));
+    await expect(
+      scanRollout(file, {
+        uploadedTurnIds: new Set(),
+        maxChars: 100,
+        onTurn: async () => {},
+      }),
+    ).rejects.toThrow("Retained rollout turn exceeds safety limit");
   });
 });

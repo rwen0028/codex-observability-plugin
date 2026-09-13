@@ -252,3 +252,166 @@ describe("parseSession", () => {
     expect(tool.output).toBe("patched");
   });
 });
+
+describe("reasoning capture", () => {
+  const timestamp = "2026-09-13T00:00:00.000Z";
+  const line = (type: string, payload: Record<string, unknown>): RolloutLine => ({
+    timestamp,
+    type,
+    payload,
+  });
+  const start = line("event_msg", { type: "task_started", turn_id: "reasoning-turn" });
+  const complete = line("event_msg", { type: "task_complete" });
+  const parse = (...items: RolloutLine[]) => parseSession([start, ...items, complete]).turns[0];
+
+  it.each([undefined, null, [], "", [{ type: "reasoning_text", text: "" }]])(
+    "falls back from empty content %j to readable summaries without altering the source",
+    (content) => {
+      const payload = {
+        type: "reasoning",
+        id: "rs-1",
+        content,
+        summary: [
+          { type: "summary_text", text: "first" },
+          { type: "summary_text", text: "second" },
+        ],
+        encrypted_content: "opaque-test-data",
+        vendor_field: { preserved: true },
+      };
+      const before = JSON.stringify(payload);
+      const turn = parse(line("response_item", payload));
+      expect(turn.steps).toHaveLength(1);
+      expect(turn.steps[0].reasoning).toBe("first\nsecond");
+      expect(turn.steps[0].reasoningItems).toEqual([
+        { source: "response_item", timestamp, payload },
+      ]);
+      expect(JSON.stringify(payload)).toBe(before);
+      expect(turn.finalOutput).toBeUndefined();
+    },
+  );
+
+  it.each(["agent_reasoning", "agent_reasoning_raw_content"])(
+    "captures %s without a response item and preserves repeated occurrences",
+    (type) => {
+      const event = line("event_msg", { type, text: "only in the event" });
+      const turn = parse(event, event);
+      expect(turn.steps[0].reasoning).toBe("only in the event\nonly in the event");
+      expect(turn.steps[0].reasoningItems).toHaveLength(2);
+    },
+  );
+
+  it.each([true, false])(
+    "deduplicates mirrored events in either order (events first: %s)",
+    (first) => {
+      const events = ["first", "second", "missing from item"].map((text) =>
+        line("event_msg", { type: "agent_reasoning", text }),
+      );
+      const item = line("response_item", {
+        type: "reasoning",
+        content: [],
+        summary: [
+          { type: "summary_text", text: "first" },
+          { type: "summary_text", text: "second" },
+        ],
+      });
+      const turn = parse(...(first ? [...events, item] : [item, ...events]));
+      expect(turn.steps[0].reasoning?.split("\n").sort()).toEqual([
+        "first",
+        "missing from item",
+        "second",
+      ]);
+      expect(turn.steps[0].reasoningItems?.map((record) => record.payload)).toEqual(
+        (first ? [...events, item] : [item, ...events]).map((record) => record.payload),
+      );
+    },
+  );
+
+  it("prefers content for display but archives both content and summary", () => {
+    const payload = {
+      type: "reasoning",
+      content: [{ type: "reasoning_text", text: "content text" }],
+      summary: [{ type: "summary_text", text: "summary text" }],
+      encrypted_content: "opaque",
+    };
+    const turn = parse(
+      line("event_msg", { type: "agent_reasoning", text: "summary text" }),
+      line("response_item", payload),
+    );
+    expect(turn.steps[0].reasoning).toBe("content text");
+    expect(turn.steps[0].reasoningItems?.[1].payload).toEqual(payload);
+  });
+
+  it("keeps analysis out of assistant output and the final answer", () => {
+    const analysis = line("response_item", {
+      type: "message",
+      id: "analysis-1",
+      role: "assistant",
+      channel: "analysis",
+      content: [{ type: "output_text", text: "analysis text" }],
+    });
+    const mirror = line("event_msg", {
+      type: "agent_message",
+      channel: "analysis",
+      message: "analysis text",
+    });
+    const turn = parse(
+      analysis,
+      mirror,
+      line("response_item", {
+        type: "message",
+        role: "assistant",
+        channel: "final",
+        content: [{ type: "output_text", text: "answer" }],
+      }),
+    );
+    expect(turn.steps[0].reasoning).toBe("analysis text");
+    expect(turn.steps[0].text).toBe("answer");
+    expect(turn.finalOutput).toBe("answer");
+    expect(parse(analysis, mirror).finalOutput).toBeUndefined();
+  });
+
+  it("archives encrypted-only items and keeps usage attached to the same model step", () => {
+    const payload = {
+      type: "reasoning",
+      id: "encrypted",
+      summary: [],
+      content: null,
+      encrypted_content: "ciphertext",
+    };
+    const usage = {
+      input_tokens: 100,
+      output_tokens: 20,
+      reasoning_output_tokens: 10,
+      total_tokens: 120,
+    };
+    const turn = parse(
+      line("response_item", payload),
+      line("event_msg", {
+        type: "token_count",
+        info: { last_token_usage: usage, total_token_usage: usage },
+      }),
+    );
+    expect(turn.steps).toHaveLength(1);
+    expect(turn.steps[0].reasoning).toBeUndefined();
+    expect(turn.steps[0].reasoningItems?.[0].payload).toEqual(payload);
+    expect(turn.steps[0].usage).toEqual(usage);
+    expect(turn.totalUsage).toEqual(usage);
+  });
+
+  it("only deduplicates identical item ids within a model step", () => {
+    const item = line("response_item", { type: "reasoning", id: "same-id", content: "repeated" });
+    const turn = parse(item, item, line("event_msg", { type: "token_count" }), item);
+    expect(turn.steps.map((step) => step.reasoning)).toEqual(["repeated", "repeated"]);
+    expect(turn.steps.map((step) => step.reasoningItems?.length)).toEqual([2, 1]);
+  });
+
+  it("preserves event-only reasoning in interrupted and unfinished turns", () => {
+    const event = line("event_msg", { type: "agent_reasoning", text: "unfinished thought" });
+    for (const ending of [[], [line("event_msg", { type: "turn_aborted" })]]) {
+      const turn = parseSession([start, event, ...ending]).turns[0];
+      expect(turn.steps[0].reasoning).toBe("unfinished thought");
+      expect(turn.completed).toBe(ending.length > 0);
+      expect(turn.aborted).toBe(ending.length > 0);
+    }
+  });
+});

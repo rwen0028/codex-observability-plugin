@@ -96,6 +96,7 @@ export async function runUploadWorker(
         config,
         snapshotBytes,
         deferCommit: true,
+        flush: instrumentation.flush,
       });
       // The legacy implementation wrote turn ids before this awaited flush.
       // A timeout/crash could therefore claim success for data never exported.

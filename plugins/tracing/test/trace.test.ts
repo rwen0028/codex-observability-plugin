@@ -489,3 +489,128 @@ describe("deterministic trace ids (trace_seed)", () => {
     expect(roots[0].spanContext().traceId).toBe(seededTraceId(`${seed}:2`));
   });
 });
+
+describe("reasoning archives", () => {
+  it("exports unclipped structured reasoning through the SDK and uploads it only once", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+    const payload = {
+      type: "reasoning",
+      id: "rs-archive",
+      content: [],
+      summary: [{ type: "summary_text", text: "思考".repeat(20_001) }],
+      encrypted_content: "opaque-test-archive".repeat(2_000),
+    };
+    const lines = fs
+      .readFileSync(file, "utf-8")
+      .trim()
+      .split("\n")
+      .map((raw) => JSON.parse(raw));
+    const reasoning = lines.find((line) => line.payload.type === "reasoning");
+    reasoning.payload = payload;
+    const index = lines.indexOf(reasoning);
+    const event = {
+      timestamp: reasoning.timestamp,
+      type: "event_msg",
+      payload: {
+        type: "agent_reasoning",
+        text: payload.summary[0].text,
+      },
+    };
+    lines.splice(index, 0, event);
+    fs.writeFileSync(
+      file,
+      lines
+        .map((line) => JSON.stringify(line))
+        .join("\n")
+        .replaceAll("gpt-5.4", "gpt-5.6-sol") + "\n",
+    );
+    const config = { ...baseConfig, max_chars: 100 };
+    await convertRollout(file, { config });
+    const generations = exporter
+      .getFinishedSpans()
+      .filter((span) => obsType(span) === "generation");
+    expect(generations).toHaveLength(2);
+    const generation = generations.find((span) =>
+      attr(span, "langfuse.observation.usage_details").includes("120"),
+    )!;
+    const output = JSON.parse(attr(generation, "langfuse.observation.output"));
+    expect(output.reasoning).toContain("[truncated");
+    expect(output.reasoning_items).toEqual([
+      { source: "event_msg", timestamp: event.timestamp, payload: event.payload },
+      { source: "response_item", timestamp: reasoning.timestamp, payload },
+    ]);
+    expect(output.tool_calls).toEqual([
+      { id: "call-1", name: "exec_command", arguments: { command: ["ls"] } },
+    ]);
+    expect(attr(generation, "langfuse.observation.metadata.cctrace.reasoning_schema")).toBe("1");
+    const costs = JSON.parse(attr(generation, "langfuse.observation.cost_details"));
+    expect(costs.total).toBeCloseTo(0.0011, 12);
+    exporter.reset();
+    await convertRollout(file, { config });
+    expect(exporter.getFinishedSpans()).toHaveLength(0);
+  });
+
+  it("rejects an oversized pending turn before any earlier turn is exported or acknowledged", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+    const timestamp = "2026-09-13T00:00:00.000Z";
+    const pending = [
+      {
+        timestamp,
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "oversized-turn" },
+      },
+      {
+        timestamp,
+        type: "response_item",
+        payload: { type: "reasoning", encrypted_content: "x".repeat(16 * 1024 * 1024) },
+      },
+      { timestamp, type: "event_msg", payload: { type: "task_complete" } },
+    ];
+    fs.appendFileSync(file, pending.map((line) => JSON.stringify(line)).join("\n") + "\n");
+    await expect(convertRollout(file, { config: baseConfig })).rejects.toThrow(
+      "Rollout event exceeds safety limit",
+    );
+    expect(exporter.getFinishedSpans()).toHaveLength(0);
+    expect(fs.existsSync(file + ".langfuse")).toBe(false);
+    expect(fs.existsSync(file + ".langfuse.state.json")).toBe(false);
+  });
+});
+
+describe("per-turn export backpressure", () => {
+  it("flushes completed turns one at a time before acknowledging the snapshot", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-two-turns-main.jsonl");
+    const counts: number[] = [];
+    const conversion = await convertRollout(file, {
+      config: baseConfig,
+      deferCommit: true,
+      flush: async () => {
+        counts.push(
+          exporter.getFinishedSpans().filter((span) => span.name === "Codex Turn").length,
+        );
+        exporter.reset();
+        expect(fs.existsSync(file + ".langfuse")).toBe(false);
+      },
+    });
+    expect(counts).toEqual([1, 1]);
+    await conversion.commit();
+    expect(fs.existsSync(file + ".langfuse")).toBe(true);
+  });
+
+  it("does not acknowledge a turn when its flush fails", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+    await expect(
+      convertRollout(file, {
+        config: baseConfig,
+        flush: async () => {
+          throw new Error("synthetic flush failure");
+        },
+      }),
+    ).rejects.toThrow("synthetic flush failure");
+    expect(fs.existsSync(file + ".langfuse")).toBe(false);
+    expect(fs.existsSync(file + ".langfuse.state.json")).toBe(false);
+  });
+});

@@ -4,6 +4,7 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type { Config } from "./config.js";
 
 export type Instrumentation = {
+  flush: () => Promise<void>;
   /** Flush buffered spans and tear down the tracer provider. */
   shutdown: () => Promise<void>;
 };
@@ -16,10 +17,9 @@ export type Instrumentation = {
  * instrumentation loading. Registering the provider also installs the
  * AsyncLocalStorage context manager that `propagateAttributes` relies on.
  *
- * We use `exportMode: "batched"` and flush once at the end: the whole rollout
- * is converted in-process, so batching every span into one (or a few) requests
- * is far faster than one request per span — important for the hook's timeout
- * budget. `shutdown()` below calls `forceFlush()` before the process exits.
+ * Spans are batched within each turn. The worker awaits a flush between turns
+ * so full reasoning archives cannot accumulate across a large upload backlog.
+ * `shutdown()` also flushes before the process exits.
  */
 export function setupInstrumentation(config: Config): Instrumentation {
   const spanProcessor = new LangfuseSpanProcessor({
@@ -38,6 +38,7 @@ export function setupInstrumentation(config: Config): Instrumentation {
   provider.register();
 
   return {
+    flush: () => spanProcessor.forceFlush(),
     shutdown: async () => {
       await spanProcessor.forceFlush();
       await provider.shutdown();
