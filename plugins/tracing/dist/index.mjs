@@ -47529,7 +47529,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.7";
+var version = "0.2.8";
 
 //#endregion
 //#region src/version.ts
