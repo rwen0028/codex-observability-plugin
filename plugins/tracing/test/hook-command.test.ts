@@ -19,12 +19,11 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-function readHookCommand(platform = process.platform): string {
+function readHookCommand(): string {
   const config = JSON.parse(fs.readFileSync(hookConfigFile, "utf-8")) as {
-    hooks: { Stop: Array<{ hooks: Array<{ command: string; commandWindows?: string }> }> };
+    hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> };
   };
-  const hook = config.hooks.Stop[0].hooks[0];
-  return platform === "win32" ? (hook.commandWindows ?? hook.command) : hook.command;
+  return config.hooks.Stop[0].hooks[0].command;
 }
 
 function runShellCommand(
@@ -68,40 +67,44 @@ afterEach(() => {
 });
 
 describe("bundled Stop hook command", () => {
-  it.each([process.platform, ...(process.platform === "win32" ? [] : ["win32" as const])])(
-    "runs the %s launcher from an arbitrary session cwd via PLUGIN_ROOT",
-    async (platform) => {
-      const codexHome = makeTempDir("lf-codex-home-");
-      const sessionCwd = makeTempDir("lf-codex-cwd-");
+  it("runs from an arbitrary session cwd via the Codex-provided PLUGIN_ROOT", async () => {
+    const codexHome = makeTempDir("lf-codex-home-");
+    const sessionCwd = makeTempDir("lf-codex-cwd-");
+    const pluginRoot = makeTempDir("lf-codex-插件 path-");
+    fs.mkdirSync(path.join(pluginRoot, "dist"));
+    fs.copyFileSync(
+      path.join(repoRoot, "plugins/tracing/dist/index.mjs"),
+      path.join(pluginRoot, "dist/index.mjs"),
+    );
 
-      const { code, stderr, stdout } = await runShellCommand(readHookCommand(platform), {
-        cwd: sessionCwd,
-        env: {
-          ...process.env,
-          PLUGIN_ROOT: path.join(repoRoot, "plugins/tracing"),
-          CODEX_HOME: codexHome,
-          HOME: codexHome,
-        },
-        input: JSON.stringify({
-          hook_event_name: "Stop",
-          transcript_path: path.join(sessionCwd, "rollout.jsonl"),
-        }),
-      });
+    // Codex substitutes plugin variables before invoking the native shell.
+    // https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs
+    const command = readHookCommand().replaceAll("${PLUGIN_ROOT}", pluginRoot);
+    const { code, stderr, stdout } = await runShellCommand(command, {
+      cwd: sessionCwd,
+      env: {
+        ...process.env,
+        PLUGIN_ROOT: pluginRoot,
+        CODEX_HOME: codexHome,
+        HOME: codexHome,
+      },
+      input: JSON.stringify({
+        hook_event_name: "Stop",
+        transcript_path: path.join(sessionCwd, "rollout.jsonl"),
+      }),
+    });
 
-      expect(code).toBe(0);
-      expect(stdout).toBe("");
-      expect(stderr).toBe("");
-    },
-  );
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
+  });
 
   it("does not depend on the old marketplace-root relative path", () => {
     expect(readHookCommand()).not.toContain("plugins/cache/");
   });
 
   it("keeps an identical trusted command across plugin versions", () => {
-    expect(readHookCommand("linux")).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
-    expect(readHookCommand("win32")).toContain("process.env.PLUGIN_ROOT");
-    expect(readHookCommand("win32")).not.toContain("${PLUGIN_ROOT}");
+    expect(readHookCommand()).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
     expect(readHookCommand()).not.toMatch(/\d+\.\d+\.\d+/);
   });
 

@@ -30,7 +30,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * Diagnostic build marker. Delivery idempotency comes from stable observation
  * identities, not from the presence of a version field.
  */
-const TRACE_PATCH_VERSION = "2.5.2";
+const TRACE_PATCH_VERSION = "2.5.3";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
