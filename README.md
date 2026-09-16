@@ -141,13 +141,13 @@ server prices alone does not replace amounts from an old plugin.
 
 Define prices for these exact, mutually exclusive usage keys:
 
-| Usage key | Meaning |
-| --- | --- |
-| `input` | Input excluding cached reads and cache writes |
-| `input_cached` | Cached input reads |
-| `input_cache_write` | Cache writes, when Codex supplies them |
-| `output` | Output excluding reasoning |
-| `output_reasoning` | Reasoning output, normally priced at the output rate |
+| Usage key           | Meaning                                              |
+| ------------------- | ---------------------------------------------------- |
+| `input`             | Input excluding cached reads and cache writes        |
+| `input_cached`      | Cached input reads                                   |
+| `input_cache_write` | Cache writes, when Codex supplies them               |
+| `output`            | Output excluding reasoning                           |
+| `output_reasoning`  | Reasoning output, normally priced at the output rate |
 
 Do not price `total` alongside these buckets. Context thresholds must sum
 `^input` keys, including cached reads and cache writes. Current Codex uses
@@ -168,8 +168,16 @@ See [Langfuse cost tracking](https://langfuse.com/docs/observability/features/to
 ## Deterministic trace ids
 
 By default, trace ids are deterministically derived from the Codex session and turn ids. This makes
-an upload retry target the same top-level trace instead of creating another trace, without making
-ids predictable outside that session. An external system
+an upload retry target the same top-level trace instead of creating another trace.
+Version 0.2.10 also makes every observation ID stable: roots use the session/turn identity,
+native model calls use the response ID within that turn, legacy calls use their step position,
+and tools use their parent generation and call ID. Retry after a lost acknowledgement therefore
+updates the same records instead of adding another billable set. A custom OpenTelemetry ID
+generator preserves real root spans, including trace input/output; no synthetic parent is needed.
+
+Identities are independent of credentials, plugin versions, prices, and upload attempts.
+The existing upload ledger and byte checkpoint remain in place. This does not replay, delete,
+or deduplicate historical observations created with older random IDs. An external system
 (a CI harness, benchmark runner, or dataset-experiment service) can set
 `LANGFUSE_CODEX_TRACE_SEED` (or `trace_seed` in `langfuse.json`) to precompute ids instead:
 
@@ -180,7 +188,7 @@ The main-thread formula deliberately excludes the Codex thread id, so you can co
 
 **Use a unique seed per session** (e.g. a UUID or your job/run id). Reusing a seed across sessions produces colliding trace ids, and the second upload would merge into (and overwrite parts of) the first trace.
 
-If derivation ever fails, the hook falls back to auto-generated ids and still uploads — it never blocks the session (set `LANGFUSE_CODEX_FAIL_ON_ERROR=true` while testing to surface such errors).
+If explicit-seed derivation fails, the hook falls back to stable native session/turn IDs and still uploads — it never blocks the session (set `LANGFUSE_CODEX_FAIL_ON_ERROR=true` while testing to surface such errors).
 
 ### Example: link a Codex run to a dataset run item
 
@@ -248,23 +256,23 @@ The default root is `$CODEX_HOME/cctrace/support-context` (or
 
 ## JSON config reference
 
-| Config key            | Environment variable                                          | Default                               | Description                       |
-| --------------------- | ------------------------------------------------------------- | ------------------------------------- | --------------------------------- |
-| `enabled`             | `TRACE_TO_LANGFUSE`                                           | `false`                               | Enable tracing                    |
-| `public_key`          | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                                     | Langfuse public key               |
-| `secret_key`          | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                                     | Langfuse secret key               |
-| `base_url`            | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com`          | Langfuse host                     |
-| `environment`         | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                                     | Environment label                 |
-| `user_id`             | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found            | User id for all traces            |
-| `tags`                | `LANGFUSE_CODEX_TAGS`                                         | —                                     | Tags for all traces               |
-| `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                                     | Metadata object for all traces    |
-| `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                                     | Deterministic trace-id seed       |
-| `support_context_dir` | `LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR`                          | `$CODEX_HOME/cctrace/support-context` | CloseClaw per-turn context root   |
-| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                            | Service-mode hint for Langfuse       |
+| Config key            | Environment variable                                          | Default                               | Description                           |
+| --------------------- | ------------------------------------------------------------- | ------------------------------------- | ------------------------------------- |
+| `enabled`             | `TRACE_TO_LANGFUSE`                                           | `false`                               | Enable tracing                        |
+| `public_key`          | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_CODEX_PUBLIC_KEY`           | —                                     | Langfuse public key                   |
+| `secret_key`          | `LANGFUSE_SECRET_KEY` / `LANGFUSE_CODEX_SECRET_KEY`           | —                                     | Langfuse secret key                   |
+| `base_url`            | `LANGFUSE_BASE_URL` / `LANGFUSE_CODEX_BASE_URL`               | `https://cloud.langfuse.com`          | Langfuse host                         |
+| `environment`         | `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_CODEX_ENVIRONMENT` | —                                     | Environment label                     |
+| `user_id`             | `LANGFUSE_CODEX_USER_ID`                                      | Codex auth email, if found            | User id for all traces                |
+| `tags`                | `LANGFUSE_CODEX_TAGS`                                         | —                                     | Tags for all traces                   |
+| `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                                     | Metadata object for all traces        |
+| `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                                     | Deterministic trace-id seed           |
+| `support_context_dir` | `LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR`                          | `$CODEX_HOME/cctrace/support-context` | CloseClaw per-turn context root       |
+| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                            | Service-mode hint for Langfuse        |
 | `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                               | Regional-processing hint for Langfuse |
-| `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                               | Input/output truncation threshold |
-| `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                               | Verbose logging                   |
-| `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                               | Fail the hook on upload errors    |
+| `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                               | Input/output truncation threshold     |
+| `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                               | Verbose logging                       |
+| `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                               | Fail the hook on upload errors        |
 
 ## Troubleshooting
 

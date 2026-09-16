@@ -6,6 +6,8 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import * as zlib from "zlib";
 import { Readable } from "stream";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomBytes } from "node:crypto";
 
 //#region rolldown:runtime
 var __create = Object.create;
@@ -46199,8 +46201,35 @@ var require_src = /* @__PURE__ */ __commonJSMin(((exports) => {
 }));
 
 //#endregion
-//#region src/instrumentation.ts
+//#region src/identity.ts
 var import_src = require_src();
+const observationIds = new AsyncLocalStorage();
+function digest(kind, parts, length) {
+	const value = createHash("sha256").update(JSON.stringify([
+		"cctrace-identity-v1",
+		kind,
+		...parts
+	])).digest("hex").slice(0, length);
+	return /^0+$/.test(value) ? "0".repeat(length - 1) + "1" : value;
+}
+const stableTraceId = (...parts) => digest("trace", parts, 32);
+const stableSpanId = (...parts) => digest("span", parts, 16);
+/** Apply IDs only while synchronously starting this observation. */
+function withObservationIds(ids, start) {
+	return observationIds.run(ids, start);
+}
+/** Uses the SDK's ID-generator extension point, without inventing a parent span. */
+var ObservationIdGenerator = class {
+	generateTraceId() {
+		return observationIds.getStore()?.traceId ?? randomBytes(16).toString("hex");
+	}
+	generateSpanId() {
+		return observationIds.getStore()?.spanId ?? randomBytes(8).toString("hex");
+	}
+};
+
+//#endregion
+//#region src/instrumentation.ts
 /**
 * Configure an isolated OpenTelemetry tracer provider wired to Langfuse.
 *
@@ -46222,7 +46251,10 @@ function setupInstrumentation(config$1) {
 		exportMode: "batched",
 		shouldExportSpan: () => true
 	});
-	const provider = new import_src.NodeTracerProvider({ spanProcessors: [spanProcessor] });
+	const provider = new import_src.NodeTracerProvider({
+		idGenerator: new ObservationIdGenerator(),
+		spanProcessors: [spanProcessor]
+	});
 	provider.register();
 	return {
 		flush: () => spanProcessor.forceFlush(),
@@ -47482,7 +47514,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.9";
+var version = "0.2.10";
 
 //#endregion
 //#region src/version.ts
@@ -47493,11 +47525,10 @@ const PLUGIN_VERSION = version;
 //#region src/trace.ts
 init_esm$2();
 /**
-* Stamped into every emitted trace so uploads self-identify which build
-* produced them: a trace without this field came from a plugin build that
-* still traces each turn more than once.
+* Diagnostic build marker. Delivery idempotency comes from stable observation
+* identities, not from the presence of a version field.
 */
-const TRACE_PATCH_VERSION = "2.5.0";
+const TRACE_PATCH_VERSION = "2.5.1";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *
@@ -47526,39 +47557,23 @@ async function findSubagentRollout(parentFile, threadId) {
 	return walk(root);
 }
 /**
-* Placeholder parent span id used to pin a deterministic trace id on a root
-* span (the pattern the Langfuse SDK documents for custom trace ids). The id
-* never exists as a real span, so Langfuse still renders the turn as the
-* trace root.
+* Explicit seeds retain the externally precomputed trace-ID contract.
+* Ordinary turns use their native identity. Both paths create real roots,
+* so Langfuse can populate trace input/output without a synthetic parent.
 */
-const SEED_PARENT_SPAN_ID = "0123456789abcdef";
-/**
-* Derive a deterministic trace id for every turn.
-*
-* Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
-* Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
-*
-* The main-thread form deliberately excludes the thread id so external systems
-* can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
-* thread exists. Without an explicit seed, use an ordinary root span: a
-* synthetic parent span id is not a real Langfuse observation and makes some
-* Langfuse versions render the trace-level input/output as empty.
-*/
-async function seededTraceParent(config$1, sessionMeta, turnNumber, supportTraceSeed) {
+async function traceIdForTurn(config$1, sessionMeta, turnNumber, fallbackTraceId, supportTraceSeed) {
 	const traceSeed = supportTraceSeed ?? config$1.trace_seed;
-	if (!traceSeed) return void 0;
+	if (!traceSeed) return fallbackTraceId;
 	try {
-		return {
-			traceId: await createTraceId(sessionMeta.isSubagentThread ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}` : `${traceSeed}:${turnNumber}`),
-			spanId: SEED_PARENT_SPAN_ID,
-			traceFlags: TraceFlags.SAMPLED,
-			isRemote: true
-		};
+		return await createTraceId(sessionMeta.isSubagentThread ? traceSeed + ":" + sessionMeta.sessionId + ":" + turnNumber : traceSeed + ":" + turnNumber);
 	} catch (error) {
-		debugLog("failed to derive deterministic trace id; falling back to auto-generated:", error);
+		debugLog("failed to derive explicit trace seed; using stable native identity:", error);
 		if (config$1.fail_on_error) throw error;
-		return;
+		return fallbackTraceId;
 	}
+}
+function turnIdentity(rolloutFile, sessionMeta, turn) {
+	return [sessionMeta.sessionId && sessionMeta.sessionId !== "unknown" ? sessionMeta.sessionId : path.basename(rolloutFile), turn.turnId ?? "legacy-start:" + turn.startTime];
 }
 function toUsageDetails(usage) {
 	return normalizeUsage(usage);
@@ -47599,7 +47614,11 @@ function toolObservationName(tc) {
 async function emitTurn(turn, sessionMeta, ctx) {
 	const clip = makeClip(ctx.config.max_chars);
 	const isSubagent = sessionMeta.isSubagentThread === true || ctx.parentObservation != null;
-	const root = startObservation(isSubagent ? "Codex Subagent Turn" : "Codex Turn", {
+	const identity = turnIdentity(ctx.rolloutFile, sessionMeta, turn);
+	const root = withObservationIds({
+		spanId: stableSpanId("turn", ...identity),
+		traceId: ctx.traceId
+	}, () => context.with(trace.deleteSpan(context.active()), () => startObservation(isSubagent ? "Codex Subagent Turn" : "Codex Turn", {
 		input: turn.userInput != null ? clip(turn.userInput) : void 0,
 		output: turn.finalOutput != null ? clip(turn.finalOutput) : void 0,
 		level: turn.aborted ? "WARNING" : void 0,
@@ -47614,13 +47633,14 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			"codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
 			"cctrace.patch": TRACE_PATCH_VERSION,
 			"cctrace.upload_schema": 2,
+			"cctrace.identity_schema": 1,
 			"cctrace.plugin_version": PLUGIN_VERSION
 		}
 	}, {
 		asType: "agent",
 		startTime: new Date(turn.startTime),
-		parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent
-	});
+		parentSpanContext: ctx.parentObservation?.otelSpan.spanContext()
+	})));
 	if (ctx.traceAttributes) context.with(trace.setSpan(context.active(), root.otelSpan), () => propagateAttributes(ctx.traceAttributes, () => void 0));
 	let previousToolResults = void 0;
 	for (let i = 0; i < turn.steps.length; i++) {
@@ -47628,7 +47648,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 		const usageDetails = toUsageDetails(step.usage);
 		const mode = pricingMode(turn, ctx.config.pricing_mode);
 		const effort = reasoningEffort(turn);
-		const generation = startObservation(isSubagent ? "LLM Subagent" : "LLM", {
+		const generation = withObservationIds({ spanId: stableSpanId("generation", ...identity, ...step.responseId ? ["response", step.responseId] : ["legacy-step", i]) }, () => startObservation(isSubagent ? "LLM Subagent" : "LLM", {
 			input: i === 0 ? turn.userInput != null ? clip(turn.userInput) : void 0 : previousToolResults,
 			output: buildGenerationOutput(step, clip),
 			model: turn.model,
@@ -47650,7 +47670,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 			asType: "generation",
 			startTime: new Date(step.startTime),
 			parentSpanContext: root.otelSpan.spanContext()
-		});
+		}));
 		for (const tc of step.toolCalls) emitToolCall(tc, generation, clip, step.endTime);
 		generation.end(new Date(step.endTime));
 		previousToolResults = step.toolCalls.length > 0 ? step.toolCalls.map((tc) => ({
@@ -47674,7 +47694,7 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	root.end(new Date(turn.endTime));
 }
 function emitToolCall(tc, parent, clip, fallbackEnd) {
-	startObservation(toolObservationName(tc), {
+	withObservationIds({ spanId: stableSpanId("tool", parent.otelSpan.spanContext().spanId, tc.callId) }, () => startObservation(toolObservationName(tc), {
 		input: tc.args,
 		output: tc.output != null ? clip(toText(tc.output)) : void 0,
 		level: tc.error ? "ERROR" : void 0,
@@ -47687,7 +47707,7 @@ function emitToolCall(tc, parent, clip, fallbackEnd) {
 		asType: "tool",
 		startTime: new Date(tc.startTime),
 		parentSpanContext: parent.otelSpan.spanContext()
-	}).end(new Date(tc.endTime ?? fallbackEnd));
+	})).end(new Date(tc.endTime ?? fallbackEnd));
 }
 async function convertRollout(rolloutFile, options) {
 	const uploaded = options.parentObservation ? /* @__PURE__ */ new Set() : await loadUploadedTurnIds(rolloutFile);
@@ -47721,7 +47741,7 @@ async function convertRollout(rolloutFile, options) {
 				return;
 			}
 			const supportContext = turn.turnId ? await loadSupportTraceContext(options.config.support_context_dir, sessionMeta.sessionId, turn.turnId) : void 0;
-			const seededParent = await seededTraceParent(options.config, sessionMeta, turnNumber, supportContext?.trace_seed);
+			const traceId = await traceIdForTurn(options.config, sessionMeta, turnNumber, stableTraceId(...turnIdentity(rolloutFile, sessionMeta, turn)), supportContext?.trace_seed);
 			const userId = supportContext?.user_id ?? options.config.user_id;
 			const tags = [...options.config.tags ?? [], ...supportContext ? [
 				"closeclaw-support",
@@ -47751,7 +47771,7 @@ async function convertRollout(rolloutFile, options) {
 				await emitTurn(turn, sessionMeta, {
 					config: options.config,
 					rolloutFile,
-					seededParent,
+					traceId,
 					traceAttributes,
 					flush: options.flush
 				});

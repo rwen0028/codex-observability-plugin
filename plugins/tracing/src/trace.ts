@@ -9,14 +9,10 @@ import {
   type LangfuseObservation,
   type PropagateAttributesParams,
 } from "@langfuse/tracing";
-import {
-  context as otelContext,
-  trace as otelTrace,
-  TraceFlags,
-  type SpanContext,
-} from "@opentelemetry/api";
+import { context as otelContext, trace as otelTrace } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
+import { stableSpanId, stableTraceId, withObservationIds } from "./identity.js";
 import { normalizeUsage, pricingMode, reasoningEffort } from "./pricing.js";
 import {
   loadUploadedTurnIds,
@@ -31,11 +27,10 @@ import { debugLog, toText, truncate } from "./utils.js";
 import { PLUGIN_VERSION } from "./version.js";
 
 /**
- * Stamped into every emitted trace so uploads self-identify which build
- * produced them: a trace without this field came from a plugin build that
- * still traces each turn more than once.
+ * Diagnostic build marker. Delivery idempotency comes from stable observation
+ * identities, not from the presence of a version field.
  */
-const TRACE_PATCH_VERSION = "2.5.0";
+const TRACE_PATCH_VERSION = "2.5.1";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
@@ -74,48 +69,37 @@ async function findSubagentRollout(
 }
 
 /**
- * Placeholder parent span id used to pin a deterministic trace id on a root
- * span (the pattern the Langfuse SDK documents for custom trace ids). The id
- * never exists as a real span, so Langfuse still renders the turn as the
- * trace root.
+ * Explicit seeds retain the externally precomputed trace-ID contract.
+ * Ordinary turns use their native identity. Both paths create real roots,
+ * so Langfuse can populate trace input/output without a synthetic parent.
  */
-const SEED_PARENT_SPAN_ID = "0123456789abcdef";
-
-/**
- * Derive a deterministic trace id for every turn.
- *
- * Main-thread turn N (1-based, rollout order):  createTraceId(`${seed}:${N}`)
- * Subagent-thread turn N:                       createTraceId(`${seed}:${threadId}:${N}`)
- *
- * The main-thread form deliberately excludes the thread id so external systems
- * can precompute trace ids (hex(sha256(seed)).slice(0, 32)) before the Codex
- * thread exists. Without an explicit seed, use an ordinary root span: a
- * synthetic parent span id is not a real Langfuse observation and makes some
- * Langfuse versions render the trace-level input/output as empty.
- */
-async function seededTraceParent(
+async function traceIdForTurn(
   config: Config,
   sessionMeta: SessionMeta,
   turnNumber: number,
+  fallbackTraceId: string,
   supportTraceSeed?: string,
-): Promise<SpanContext | undefined> {
+): Promise<string> {
   const traceSeed = supportTraceSeed ?? config.trace_seed;
-  if (!traceSeed) return undefined;
+  if (!traceSeed) return fallbackTraceId;
   try {
     const seed = sessionMeta.isSubagentThread
-      ? `${traceSeed}:${sessionMeta.sessionId}:${turnNumber}`
-      : `${traceSeed}:${turnNumber}`;
-    return {
-      traceId: await createTraceId(seed),
-      spanId: SEED_PARENT_SPAN_ID,
-      traceFlags: TraceFlags.SAMPLED,
-      isRemote: true,
-    };
+      ? traceSeed + ":" + sessionMeta.sessionId + ":" + turnNumber
+      : traceSeed + ":" + turnNumber;
+    return await createTraceId(seed);
   } catch (error) {
-    debugLog("failed to derive deterministic trace id; falling back to auto-generated:", error);
+    debugLog("failed to derive explicit trace seed; using stable native identity:", error);
     if (config.fail_on_error) throw error;
-    return undefined;
+    return fallbackTraceId;
   }
+}
+
+function turnIdentity(rolloutFile: string, sessionMeta: SessionMeta, turn: Turn): string[] {
+  const thread =
+    sessionMeta.sessionId && sessionMeta.sessionId !== "unknown"
+      ? sessionMeta.sessionId
+      : path.basename(rolloutFile);
+  return [thread, turn.turnId ?? "legacy-start:" + turn.startTime];
 }
 
 function toUsageDetails(usage: TokenUsage | undefined): Record<string, number> | undefined {
@@ -175,8 +159,8 @@ async function emitTurn(
     rolloutFile: string;
     flush?: () => Promise<void>;
     parentObservation?: LangfuseObservation;
-    /** Pre-derived trace id for top-level turns (see seededTraceParent). */
-    seededParent?: SpanContext;
+    /** Stable trace ID for a top-level turn; nested turns inherit their parent. */
+    traceId?: string;
     /** Trace-level identity applied after the root observation exists. */
     traceAttributes?: PropagateAttributesParams;
   },
@@ -187,37 +171,43 @@ async function emitTurn(
   // thread or when it is being nested under a spawning turn.
   const isSubagent = sessionMeta.isSubagentThread === true || ctx.parentObservation != null;
 
-  const root = startObservation(
-    isSubagent ? "Codex Subagent Turn" : "Codex Turn",
-    {
-      input: turn.userInput != null ? clip(turn.userInput) : undefined,
-      output: turn.finalOutput != null ? clip(turn.finalOutput) : undefined,
-      level: turn.aborted ? "WARNING" : undefined,
-      statusMessage: turn.aborted ? "Turn interrupted by user" : undefined,
-      metadata: {
-        "codex.turn_id": turn.turnId,
-        "codex.thread_id": sessionMeta.sessionId,
-        "codex.model": turn.model,
-        "codex.model_provider": sessionMeta.modelProvider,
-        "codex.cli_version": sessionMeta.cliVersion,
-        "codex.aborted": turn.aborted,
-        "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
-        "cctrace.patch": TRACE_PATCH_VERSION,
-        "cctrace.upload_schema": 2,
-        "cctrace.plugin_version": PLUGIN_VERSION,
-      },
-    },
-    {
-      asType: "agent",
-      startTime: new Date(turn.startTime),
-      parentSpanContext: ctx.parentObservation?.otelSpan.spanContext() ?? ctx.seededParent,
-    },
+  const identity = turnIdentity(ctx.rolloutFile, sessionMeta, turn);
+  const root = withObservationIds(
+    { spanId: stableSpanId("turn", ...identity), traceId: ctx.traceId },
+    () =>
+      otelContext.with(otelTrace.deleteSpan(otelContext.active()), () =>
+        startObservation(
+          isSubagent ? "Codex Subagent Turn" : "Codex Turn",
+          {
+            input: turn.userInput != null ? clip(turn.userInput) : undefined,
+            output: turn.finalOutput != null ? clip(turn.finalOutput) : undefined,
+            level: turn.aborted ? "WARNING" : undefined,
+            statusMessage: turn.aborted ? "Turn interrupted by user" : undefined,
+            metadata: {
+              "codex.turn_id": turn.turnId,
+              "codex.thread_id": sessionMeta.sessionId,
+              "codex.model": turn.model,
+              "codex.model_provider": sessionMeta.modelProvider,
+              "codex.cli_version": sessionMeta.cliVersion,
+              "codex.aborted": turn.aborted,
+              "codex.tool_call_count": turn.steps.reduce((n, s) => n + s.toolCalls.length, 0),
+              "cctrace.patch": TRACE_PATCH_VERSION,
+              "cctrace.upload_schema": 2,
+              "cctrace.identity_schema": 1,
+              "cctrace.plugin_version": PLUGIN_VERSION,
+            },
+          },
+          {
+            asType: "agent",
+            startTime: new Date(turn.startTime),
+            parentSpanContext: ctx.parentObservation?.otelSpan.spanContext(),
+          },
+        ),
+      ),
   );
 
-  // The root observation must also carry the support/user attributes because
-  // explicit trace seeds use a synthetic parent span. The outer call in
-  // convertRollout supplies trace-level attributes; this updates the active
-  // root observation as well.
+  // Apply support/user attributes to the real root observation as well as
+  // the propagated trace context.
   if (ctx.traceAttributes) {
     otelContext.with(otelTrace.setSpan(otelContext.active(), root.otelSpan), () =>
       propagateAttributes(ctx.traceAttributes!, () => undefined),
@@ -231,39 +221,49 @@ async function emitTurn(
     const usageDetails = toUsageDetails(step.usage);
     const mode = pricingMode(turn, ctx.config.pricing_mode);
     const effort = reasoningEffort(turn);
-    const generation = startObservation(
-      isSubagent ? "LLM Subagent" : "LLM",
+    const generation = withObservationIds(
       {
-        input:
-          i === 0
-            ? turn.userInput != null
-              ? clip(turn.userInput)
-              : undefined
-            : previousToolResults,
-        output: buildGenerationOutput(step, clip),
-        model: turn.model,
-        usageDetails,
-        // Ingested amounts override Langfuse prices. Leave all models to Langfuse.
-        modelParameters: { service_tier: mode },
-        metadata: {
-          "codex.step_index": i,
-          "codex.response_id": step.responseId,
-          "codex.thread_id": sessionMeta.sessionId,
-          "codex.turn_id": turn.turnId,
-          "cctrace.reasoning_schema": 1,
-          ...(effort ? { "codex.reasoning_effort": effort } : {}),
-          // Kept for verification by existing cctrace update scripts.
-          "cctrace.pricing_source": "langfuse-model-definition",
-          "cctrace.cost_calculation": "langfuse",
-          "cctrace.pricing_mode": mode,
-          "cctrace.pricing_regional": ctx.config.regional_processing,
-        },
+        spanId: stableSpanId(
+          "generation",
+          ...identity,
+          ...(step.responseId ? ["response", step.responseId] : ["legacy-step", i]),
+        ),
       },
-      {
-        asType: "generation",
-        startTime: new Date(step.startTime),
-        parentSpanContext: root.otelSpan.spanContext(),
-      },
+      () =>
+        startObservation(
+          isSubagent ? "LLM Subagent" : "LLM",
+          {
+            input:
+              i === 0
+                ? turn.userInput != null
+                  ? clip(turn.userInput)
+                  : undefined
+                : previousToolResults,
+            output: buildGenerationOutput(step, clip),
+            model: turn.model,
+            usageDetails,
+            // Ingested amounts override Langfuse prices. Leave all models to Langfuse.
+            modelParameters: { service_tier: mode },
+            metadata: {
+              "codex.step_index": i,
+              "codex.response_id": step.responseId,
+              "codex.thread_id": sessionMeta.sessionId,
+              "codex.turn_id": turn.turnId,
+              "cctrace.reasoning_schema": 1,
+              ...(effort ? { "codex.reasoning_effort": effort } : {}),
+              // Kept for verification by existing cctrace update scripts.
+              "cctrace.pricing_source": "langfuse-model-definition",
+              "cctrace.cost_calculation": "langfuse",
+              "cctrace.pricing_mode": mode,
+              "cctrace.pricing_regional": ctx.config.regional_processing,
+            },
+          },
+          {
+            asType: "generation",
+            startTime: new Date(step.startTime),
+            parentSpanContext: root.otelSpan.spanContext(),
+          },
+        ),
     );
 
     for (const tc of step.toolCalls) {
@@ -305,20 +305,24 @@ function emitToolCall(
   clip: Clip,
   fallbackEnd: number,
 ): void {
-  const tool = startObservation(
-    toolObservationName(tc),
-    {
-      input: tc.args,
-      output: tc.output != null ? clip(toText(tc.output)) : undefined,
-      level: tc.error ? "ERROR" : undefined,
-      statusMessage: tc.error ? clip(tc.error) : undefined,
-      metadata: { "codex.call_id": tc.callId, "codex.tool_name": tc.name || "tool" },
-    },
-    {
-      asType: "tool",
-      startTime: new Date(tc.startTime),
-      parentSpanContext: parent.otelSpan.spanContext(),
-    },
+  const tool = withObservationIds(
+    { spanId: stableSpanId("tool", parent.otelSpan.spanContext().spanId, tc.callId) },
+    () =>
+      startObservation(
+        toolObservationName(tc),
+        {
+          input: tc.args,
+          output: tc.output != null ? clip(toText(tc.output)) : undefined,
+          level: tc.error ? "ERROR" : undefined,
+          statusMessage: tc.error ? clip(tc.error) : undefined,
+          metadata: { "codex.call_id": tc.callId, "codex.tool_name": tc.name || "tool" },
+        },
+        {
+          asType: "tool",
+          startTime: new Date(tc.startTime),
+          parentSpanContext: parent.otelSpan.spanContext(),
+        },
+      ),
   );
   tool.end(new Date(tc.endTime ?? fallbackEnd));
 }
@@ -395,10 +399,11 @@ export async function convertRollout(
             turn.turnId,
           )
         : undefined;
-      const seededParent = await seededTraceParent(
+      const traceId = await traceIdForTurn(
         options.config,
         sessionMeta,
         turnNumber,
+        stableTraceId(...turnIdentity(rolloutFile, sessionMeta, turn)),
         supportContext?.trace_seed,
       );
       const userId = supportContext?.user_id ?? options.config.user_id;
@@ -440,7 +445,7 @@ export async function convertRollout(
         await emitTurn(turn, sessionMeta, {
           config: options.config,
           rolloutFile,
-          seededParent,
+          traceId,
           traceAttributes,
           flush: options.flush,
         });

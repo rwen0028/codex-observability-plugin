@@ -8,10 +8,11 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Config } from "../src/config.js";
+import { ObservationIdGenerator } from "../src/identity.js";
 import { convertRollout } from "../src/trace.js";
 
 // Force seeded trace-id derivation to fail so we can assert the hook fails
-// open (uploads with auto-generated ids) unless fail_on_error is set.
+// open (uploads with stable native identities) unless fail_on_error is set.
 vi.mock("@langfuse/tracing", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@langfuse/tracing")>();
   return {
@@ -49,6 +50,7 @@ function stageFixtures(): string {
 
 beforeAll(() => {
   provider = new NodeTracerProvider({
+    idGenerator: new ObservationIdGenerator(),
     spanProcessors: [new SimpleSpanProcessor(exporter)],
   });
   provider.register();
@@ -63,13 +65,18 @@ beforeEach(() => {
 });
 
 describe("trace seed derivation failure", () => {
-  it("falls back to auto-generated trace ids and still uploads", async () => {
+  it("falls back to stable native trace ids and still uploads", async () => {
     const dir = stageFixtures();
-    await convertRollout(path.join(dir, "rollout-basic-main.jsonl"), { config: baseConfig });
+    const file = path.join(dir, "rollout-basic-main.jsonl");
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
 
     const root = exporter.getFinishedSpans().find((s) => s.name === "Codex Turn");
     expect(root, "expected the turn to upload despite the derivation failure").toBeDefined();
     expect(root!.spanContext().traceId).toMatch(/^[0-9a-f]{32}$/);
+    const firstIds = exporter.getFinishedSpans().map((span) => span.spanContext());
+    exporter.reset();
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    expect(exporter.getFinishedSpans().map((span) => span.spanContext())).toEqual(firstIds);
   });
 
   it("propagates the derivation error when fail_on_error is set", async () => {

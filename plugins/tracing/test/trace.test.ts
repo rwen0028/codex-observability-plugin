@@ -13,8 +13,10 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import type { Config } from "../src/config.js";
+import { ObservationIdGenerator } from "../src/identity.js";
 import { convertRollout } from "../src/trace.js";
 import { PLUGIN_VERSION } from "../src/version.js";
+import { runUploadWorker } from "../src/worker.js";
 
 const exporter = new InMemorySpanExporter();
 let provider: NodeTracerProvider;
@@ -58,6 +60,7 @@ const parentId = (span: ReadableSpan): string | undefined =>
 
 beforeAll(() => {
   provider = new NodeTracerProvider({
+    idGenerator: new ObservationIdGenerator(),
     spanProcessors: [new SimpleSpanProcessor(exporter)],
   });
   provider.register();
@@ -656,4 +659,159 @@ it("carries native response identity through streaming conversion to Langfuse", 
     expect(attr(generation, "langfuse.observation.metadata.codex.thread_id")).toBe("sess-basic");
     expect(attr(generation, "langfuse.observation.metadata.codex.turn_id")).toBe("turn-1");
   }
+});
+
+describe("ambiguous delivery retry", () => {
+  it.each([undefined, "explicit-retry-seed"])(
+    "reuses every observation identity after the server accepts but shutdown fails (seed %s)",
+    async (seed) => {
+      const dir = stageFixtures();
+      const file = path.join(dir, "rollout-basic-main.jsonl");
+      const config = { ...baseConfig, trace_seed: seed };
+      let loseAcknowledgement = true;
+      const dependencies = {
+        getConfig: async () => config,
+        setupInstrumentation: () => ({
+          flush: async () => {
+            await provider.forceFlush();
+          },
+          shutdown: async () => {
+            await provider.forceFlush();
+            if (loseAcknowledgement) throw new Error("accepted by server; acknowledgement lost");
+          },
+        }),
+        convertRollout,
+      };
+
+      await expect(runUploadWorker(file, dependencies)).rejects.toThrow("acknowledgement lost");
+      const accepted = exporter.getFinishedSpans().slice();
+      expect(accepted.filter((span) => obsType(span) === "generation")).toHaveLength(2);
+      expect(fs.existsSync(file + ".langfuse")).toBe(false);
+
+      exporter.reset();
+      loseAcknowledgement = false;
+      await runUploadWorker(file, dependencies);
+      const retried = exporter.getFinishedSpans();
+      const identities = (spans: ReadableSpan[]) =>
+        spans
+          .map((span) => [span.name, span.spanContext().traceId, span.spanContext().spanId])
+          .sort();
+      expect(identities(retried)).toEqual(identities(accepted));
+
+      // Langfuse must receive updates to the same generation IDs, not a second billable set.
+      const generations = new Map<string, ReadableSpan>();
+      for (const span of [...accepted, ...retried]) {
+        if (obsType(span) === "generation") generations.set(span.spanContext().spanId, span);
+      }
+      expect(generations.size).toBe(2);
+      const root = retried.find((span) => span.name === "Codex Turn")!;
+      expect(parentId(root)).toBeUndefined();
+      expect(attr(root, "langfuse.observation.input")).toContain("List the files");
+      expect(attr(root, "langfuse.observation.output")).toContain("two files");
+      expect(fs.readFileSync(file + ".langfuse", "utf8")).toBe("turn-1\n");
+
+      exporter.reset();
+      await runUploadWorker(file, dependencies);
+      expect(exporter.getFinishedSpans()).toHaveLength(0);
+    },
+  );
+
+  it("keeps all 17 native responses unique across uncommitted replays", async () => {
+    const dir = stageFixtures();
+    const file = path.join(dir, "native-retry.jsonl");
+    const rows: unknown[] = [];
+    const line = (second: number, type: string, payload: Record<string, unknown>) => ({
+      timestamp: new Date(Date.UTC(2026, 8, 16, 0, 0, second)).toISOString(),
+      type,
+      payload,
+    });
+    rows.push(line(0, "session_meta", { id: "native-retry-thread" }));
+    rows.push(line(1, "event_msg", { type: "task_started", turn_id: "native-retry-turn" }));
+    rows.push(line(1, "turn_context", { model: "gpt-6-astra" }));
+    for (let i = 0; i < 17; i++) {
+      rows.push(
+        line(2 + 2 * i, "response_item", {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "OK" }],
+        }),
+      );
+      rows.push(
+        line(3 + 2 * i, "token_usage_record", {
+          thread_id: "native-retry-thread",
+          turn_id: "native-retry-turn",
+          response_id: "resp-" + i,
+          usage: {
+            input_tokens: 100 + i,
+            cached_input_tokens: 40,
+            output_tokens: 20,
+            total_tokens: 120 + i,
+          },
+        }),
+      );
+    }
+    rows.push(line(40, "event_msg", { type: "task_complete", turn_id: "native-retry-turn" }));
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    const first = exporter.getFinishedSpans().filter((span) => obsType(span) === "generation");
+    expect(first).toHaveLength(17);
+    const byResponse = (spans: ReadableSpan[]) =>
+      Object.fromEntries(
+        spans.map((span) => [
+          attr(span, "langfuse.observation.metadata.codex.response_id"),
+          span.spanContext().spanId,
+        ]),
+      );
+    exporter.reset();
+    await convertRollout(file, { config: baseConfig, deferCommit: true });
+    const second = exporter.getFinishedSpans().filter((span) => obsType(span) === "generation");
+    expect(byResponse(second)).toEqual(byResponse(first));
+    expect(new Set([...first, ...second].map((span) => span.spanContext().spanId)).size).toBe(17);
+    expect(new Set(first.map((span) => span.spanContext().spanId)).size).toBe(17);
+  });
+
+  it("keeps copied rollouts and nested subagent observations stable on retry", async () => {
+    const firstDir = stageFixtures();
+    const secondDir = stageFixtures();
+    await convertRollout(path.join(firstDir, "rollout-parent.jsonl"), {
+      config: baseConfig,
+      deferCommit: true,
+    });
+    const first = exporter
+      .getFinishedSpans()
+      .map((span) => span.spanContext())
+      .sort((a, b) => a.spanId.localeCompare(b.spanId));
+    exporter.reset();
+    await convertRollout(path.join(secondDir, "rollout-parent.jsonl"), {
+      config: baseConfig,
+      deferCommit: true,
+    });
+    const second = exporter
+      .getFinishedSpans()
+      .map((span) => span.spanContext())
+      .sort((a, b) => a.spanId.localeCompare(b.spanId));
+    expect(second).toEqual(first);
+  });
+});
+
+describe("concurrent session identity isolation", () => {
+  it("keeps equal turn IDs in different sessions distinct during concurrent uploads", async () => {
+    const a = path.join(stageFixtures(), "rollout-basic-main.jsonl");
+    const b = path.join(stageFixtures(), "rollout-basic-main.jsonl");
+    fs.writeFileSync(b, fs.readFileSync(b, "utf8").replaceAll("sess-basic", "other-session"));
+    await Promise.all([
+      convertRollout(a, { config: baseConfig, deferCommit: true }),
+      convertRollout(b, { config: baseConfig, deferCommit: true }),
+    ]);
+    const spans = exporter.getFinishedSpans();
+    const roots = spans.filter((span) => obsType(span) === "agent");
+    expect(roots).toHaveLength(2);
+    expect(new Set(roots.map((span) => span.spanContext().traceId)).size).toBe(2);
+    expect(new Set(spans.map((span) => span.spanContext().spanId)).size).toBe(spans.length);
+    for (const root of roots) {
+      expect(parentId(root)).toBeUndefined();
+      expect(spans.filter((span) => parentId(span) === root.spanContext().spanId)).toHaveLength(2);
+    }
+  });
 });

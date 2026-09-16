@@ -2,6 +2,7 @@ import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 
 import type { Config } from "./config.js";
+import { ObservationIdGenerator } from "./identity.js";
 
 export type Instrumentation = {
   flush: () => Promise<void>;
@@ -33,6 +34,7 @@ export function setupInstrumentation(config: Config): Instrumentation {
   });
 
   const provider = new NodeTracerProvider({
+    idGenerator: new ObservationIdGenerator(),
     spanProcessors: [spanProcessor],
   });
   provider.register();
