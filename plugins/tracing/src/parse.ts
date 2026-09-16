@@ -10,6 +10,7 @@ import type {
   ResponseItemWebSearchCall,
   RolloutLine,
   SessionMeta,
+  SessionMetaPayload,
   TokenUsage,
   ToolCall,
   Turn,
@@ -78,21 +79,56 @@ function newTurn(startTime: number): MutableTurn {
  *
  * Codex interleaves model I/O (`response_item`) with lifecycle events
  * (`event_msg`). We reconstruct each turn as a sequence of model steps (one per
- * model response, delimited by `token_count` events) plus the tool calls each
+ * model response, delimited by native `token_usage_record` records or
+ * legacy `token_count` events) plus the tool calls each
  * step issued. Tool execution details (status, exit code, output) arrive later
  * as `*_end` events and are matched back to their call by `call_id`.
  */
-export function parseSession(lines: RolloutLine[]): {
+export function parseSession(
+  lines: RolloutLine[],
+  initialSessionMeta?: SessionMeta,
+): {
   sessionMeta: SessionMeta;
   turns: Turn[];
 } {
-  let sessionMeta: SessionMeta = { sessionId: "unknown" };
+  let sessionMeta: SessionMeta = initialSessionMeta ?? { sessionId: "unknown" };
   const turns: Turn[] = [];
 
   let turn: MutableTurn | null = null;
   let step: ModelStep | null = null;
   let toolCallsById = new Map<string, ToolCall>();
   let lastTimestamp = Date.now();
+  // Since Codex 0.153, these are the durable per-response records. The
+  // token_count event may also be emitted for rate limits or cumulative updates.
+  const persistedSessionId =
+    (lines.find((line) => line.type === "session_meta")?.payload as SessionMetaPayload | undefined)
+      ?.id ?? initialSessionMeta?.sessionId;
+  const nativeRecords = new Set(
+    lines.filter((line) => {
+      if (line.type !== "token_usage_record") return false;
+      const p = line.payload;
+      return (
+        typeof p.turn_id === "string" &&
+        p.turn_id.length > 0 &&
+        typeof p.response_id === "string" &&
+        p.response_id.length > 0 &&
+        typeof p.thread_id === "string" &&
+        p.thread_id.length > 0 &&
+        (typeof persistedSessionId !== "string" || p.thread_id === persistedSessionId) &&
+        p.usage != null &&
+        typeof p.usage === "object" &&
+        !Array.isArray(p.usage) &&
+        ["input_tokens", "output_tokens", "total_tokens"].every((key) => {
+          const value = (p.usage as Record<string, unknown>)[key];
+          return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+        })
+      );
+    }),
+  );
+  const nativeTurnIds = new Set(
+    [...nativeRecords].map((line) => (line.payload as Record<string, unknown>).turn_id as string),
+  );
+  let responseIds = new Set<string>();
 
   function newStep(startTime: number): ModelStep {
     return { startTime, endTime: startTime, toolCalls: [] };
@@ -123,6 +159,7 @@ export function parseSession(lines: RolloutLine[]): {
     turns.push(turn);
     turn = null;
     toolCallsById = new Map();
+    responseIds = new Set();
   };
 
   for (const line of lines) {
@@ -155,6 +192,22 @@ export function parseSession(lines: RolloutLine[]): {
       const p = line.payload as { model?: string };
       t.model = p.model ?? t.model;
       t.invocationParams = line.payload as Record<string, unknown>;
+      continue;
+    }
+
+    if (line.type === "token_usage_record") {
+      const p = line.payload;
+      if (
+        !nativeRecords.has(line) ||
+        !turn ||
+        p.turn_id !== turn.turnId ||
+        responseIds.has(p.response_id as string)
+      )
+        continue;
+      responseIds.add(p.response_id as string);
+      const s = ensureStep(ts);
+      s.responseId = p.response_id as string;
+      closeStep(ts, p.usage as TokenUsage);
       continue;
     }
 
@@ -276,7 +329,9 @@ export function parseSession(lines: RolloutLine[]): {
         turn!.lastAgentMessage = p.message;
       } else if (et === "token_count") {
         if (p.info?.total_token_usage) turn!.totalUsage = p.info.total_token_usage;
-        closeStep(ts, p.info?.last_token_usage ?? undefined);
+        if (!turn!.turnId || !nativeTurnIds.has(turn!.turnId)) {
+          closeStep(ts, p.info?.last_token_usage ?? undefined);
+        }
       } else if (et === "task_complete") {
         finishTurn(ts, { completed: true, aborted: false });
       } else if (et === "turn_aborted") {

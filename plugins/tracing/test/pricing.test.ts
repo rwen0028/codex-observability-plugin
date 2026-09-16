@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  calculateGpt56Cost,
-  normalizeUsage,
-  reasoningEffort,
-  type NormalizedUsage,
-  type PricingMode,
-} from "../src/pricing.js";
+import { pricingMode, normalizeUsage, reasoningEffort } from "../src/pricing.js";
 import type { TokenUsage, Turn } from "../src/types.js";
 
 function makeTurn(invocationParams: Record<string, unknown> = {}): Turn {
@@ -19,20 +13,6 @@ function makeTurn(invocationParams: Record<string, unknown> = {}): Turn {
     completed: true,
     aborted: false,
   };
-}
-
-function calculate(
-  model: string,
-  usage: NormalizedUsage,
-  mode: PricingMode = "standard",
-  turn = makeTurn(),
-  regionalProcessing = false,
-) {
-  return calculateGpt56Cost(model, usage, turn, { mode, regionalProcessing });
-}
-
-function totalCost(costDetails: Record<string, number>): number {
-  return costDetails.total;
 }
 
 describe("normalizeUsage", () => {
@@ -63,93 +43,14 @@ describe("normalizeUsage", () => {
   });
 });
 
-describe("GPT-5.6 official pricing", () => {
-  it("matches the live GPT-5.6 Sol LiteLLM spend sample exactly", () => {
-    const usage = normalizeUsage({
-      input_tokens: 14_487,
-      cached_input_tokens: 3_456,
-      output_tokens: 47,
-    })!;
-    const result = calculate("openai/gpt-5.6-sol", usage)!;
-
-    expect(result.contextTier).toBe("short");
-    expect(result.costDetails.input).toBeCloseTo(0.055155, 12);
-    expect(result.costDetails.input_cached).toBeCloseTo(0.001728, 12);
-    expect(result.costDetails.output).toBeCloseTo(0.00141, 12);
-    expect(totalCost(result.costDetails)).toBeCloseTo(0.058293, 12);
-  });
-
-  it("matches the live GPT-5.6 Terra LiteLLM spend sample exactly", () => {
-    const usage = normalizeUsage({
-      input_tokens: 52_987,
-      cached_input_tokens: 51_712,
-      output_tokens: 417,
-    })!;
-    const result = calculate("gpt-5.6-terra", usage)!;
-
-    expect(result.costDetails.input).toBeCloseTo(0.0031875, 12);
-    expect(result.costDetails.input_cached).toBeCloseTo(0.012928, 12);
-    expect(result.costDetails.output).toBeCloseTo(0.006255, 12);
-    expect(totalCost(result.costDetails)).toBeCloseTo(0.0223705, 12);
-  });
-
-  it("uses Luna rates and prices reasoning output as output tokens", () => {
-    const result = calculate("gpt-5.6-luna", {
-      input: 50_000,
-      input_cached: 50_000,
-      input_cache_write: 50_000,
-      output: 1_000_000,
-      output_reasoning: 1_000_000,
-    })!;
-
-    expect(result.costDetails).toEqual({
-      input: 0.05,
-      input_cached: 0.005,
-      input_cache_write: 0.0625,
-      output: 6,
-      output_reasoning: 6,
-      total: 12.1175,
-    });
-  });
-
-  it("switches to long-context rates only above 272K input tokens", () => {
-    const threshold = calculate("gpt-5.6-sol", { input: 272_000, output: 1_000_000 })!;
-    const long = calculate("gpt-5.6-sol", { input: 272_001, output: 1_000_000 })!;
-
-    expect(threshold.contextTier).toBe("short");
-    expect(threshold.costDetails.input).toBeCloseTo(1.36, 12);
-    expect(threshold.costDetails.output).toBe(30);
-    expect(long.contextTier).toBe("long");
-    expect(long.costDetails.input).toBeCloseTo(2.72001, 12);
-    expect(long.costDetails.output).toBe(45);
-  });
-
-  it.each([
-    ["batch", 0.5],
-    ["flex", 0.5],
-    ["standard", 1],
-    ["priority", 2],
-  ] as const)("applies the %s service-mode multiplier", (mode, expected) => {
-    const result = calculate("gpt-5.6-sol", { input: 200_000 }, mode)!;
-    expect(result.costDetails.input).toBeCloseTo(expected, 12);
-  });
-
-  it("prefers an observed service tier over the configured default", () => {
-    const turn = makeTurn({ service_tier: "flex" });
-    const result = calculate("gpt-5.6-sol", { input: 200_000 }, "priority", turn)!;
-
-    expect(result.mode).toBe("flex");
-    expect(result.costDetails.input).toBeCloseTo(0.5, 12);
-  });
-
-  it("adds the official 10% regional-processing surcharge", () => {
-    const result = calculate("gpt-5.6-sol", { input: 200_000 }, "standard", makeTurn(), true)!;
-    expect(result.costDetails.input).toBeCloseTo(1.1, 12);
-  });
-
-  it("omits invented pricing for unsupported priority long context and unknown models", () => {
-    expect(calculate("gpt-5.6-sol", { input: 272_001 }, "priority")).toBeUndefined();
-    expect(calculate("gpt-4.1", { input: 1_000 })).toBeUndefined();
+describe("service-mode hints", () => {
+  it.each(["priority", "fast", "flex", "batch"] as const)(
+    "preserves observed %s for Langfuse without computing a price",
+    (mode) => expect(pricingMode(makeTurn({ service_tier: mode }), "standard")).toBe(mode),
+  );
+  it("normalizes standard aliases and uses the configured fallback", () => {
+    expect(pricingMode(makeTurn({ serviceTier: "auto" }), "priority")).toBe("standard");
+    expect(pricingMode(makeTurn(), "flex")).toBe("flex");
   });
 });
 

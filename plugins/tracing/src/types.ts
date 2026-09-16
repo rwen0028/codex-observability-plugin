@@ -199,6 +199,8 @@ export type ReasoningRecord = {
 };
 
 export type ModelStep = {
+  /** Exact upstream response identity from native token_usage_record. */
+  responseId?: string;
   startTime: number;
   endTime: number;
   reasoning?: string;

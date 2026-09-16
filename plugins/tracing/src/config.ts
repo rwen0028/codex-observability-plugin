@@ -37,9 +37,9 @@ export const ConfigSchema = z.object({
   trace_seed: z.string().optional(),
   // LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR — per-thread/turn CloseClaw context sidecars
   support_context_dir: z.string().refine(path.isAbsolute, "must be an absolute path"),
-  // LANGFUSE_CODEX_PRICING_MODE — OpenAI service mode used for list-price cost
-  pricing_mode: z.enum(["standard", "batch", "flex", "priority"]),
-  // LANGFUSE_CODEX_REGIONAL_PROCESSING — OpenAI regional processing adds 10%
+  // LANGFUSE_CODEX_PRICING_MODE — service-mode hint for Langfuse model pricing
+  pricing_mode: z.enum(["standard", "batch", "flex", "priority", "fast"]),
+  // LANGFUSE_CODEX_REGIONAL_PROCESSING — regional-processing hint for Langfuse model pricing
   regional_processing: z.boolean(),
   // LANGFUSE_CODEX_MAX_CHARS — truncate large inputs/outputs
   max_chars: z.number().int().positive(),

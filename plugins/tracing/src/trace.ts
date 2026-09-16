@@ -17,7 +17,7 @@ import {
 } from "@opentelemetry/api";
 
 import type { Config } from "./config.js";
-import { calculateGpt56Cost, normalizeUsage, reasoningEffort } from "./pricing.js";
+import { normalizeUsage, pricingMode, reasoningEffort } from "./pricing.js";
 import {
   loadUploadedTurnIds,
   loadUploadState,
@@ -35,7 +35,7 @@ import { PLUGIN_VERSION } from "./version.js";
  * produced them: a trace without this field came from a plugin build that
  * still traces each turn more than once.
  */
-const TRACE_PATCH_VERSION = "2.4.2";
+const TRACE_PATCH_VERSION = "2.5.0";
 
 /**
  * Resolve a subagent's rollout file from its thread id.
@@ -229,10 +229,7 @@ async function emitTurn(
   for (let i = 0; i < turn.steps.length; i++) {
     const step = turn.steps[i];
     const usageDetails = toUsageDetails(step.usage);
-    const pricing = calculateGpt56Cost(turn.model, usageDetails, turn, {
-      mode: ctx.config.pricing_mode,
-      regionalProcessing: ctx.config.regional_processing,
-    });
+    const mode = pricingMode(turn, ctx.config.pricing_mode);
     const effort = reasoningEffort(turn);
     const generation = startObservation(
       isSubagent ? "LLM Subagent" : "LLM",
@@ -246,19 +243,20 @@ async function emitTurn(
         output: buildGenerationOutput(step, clip),
         model: turn.model,
         usageDetails,
-        costDetails: pricing?.costDetails,
+        // Ingested amounts override Langfuse prices. Leave all models to Langfuse.
+        modelParameters: { service_tier: mode },
         metadata: {
           "codex.step_index": i,
+          "codex.response_id": step.responseId,
+          "codex.thread_id": sessionMeta.sessionId,
+          "codex.turn_id": turn.turnId,
           "cctrace.reasoning_schema": 1,
           ...(effort ? { "codex.reasoning_effort": effort } : {}),
-          ...(pricing
-            ? {
-                "cctrace.pricing_source": "openai-official-2026-07-09",
-                "cctrace.pricing_mode": pricing.mode,
-                "cctrace.pricing_context": pricing.contextTier,
-                "cctrace.pricing_regional": pricing.regionalProcessing,
-              }
-            : {}),
+          // Kept for verification by existing cctrace update scripts.
+          "cctrace.pricing_source": "langfuse-model-definition",
+          "cctrace.cost_calculation": "langfuse",
+          "cctrace.pricing_mode": mode,
+          "cctrace.pricing_regional": ctx.config.regional_processing,
         },
       },
       {

@@ -128,37 +128,42 @@ Run a Codex turn, then open your Langfuse project to see the trace.
 | 🇯🇵 Japan | `https://jp.cloud.langfuse.com`    |
 | ⚕️ HIPAA | `https://hipaa.cloud.langfuse.com` |
 
-## GPT-5.6 cost calculation
+## Model usage and cost
 
-For `gpt-5.6`/`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`, the plugin sends explicit, mutually exclusive `usageDetails` and `costDetails` to Langfuse. Prices are OpenAI's official USD list prices per 1M tokens published on 2026-07-09.
+The plugin uploads model names and per-response token usage for every model.
+It does not contain model prices or send estimated `costDetails`. Configure
+prices in **Langfuse → Project Settings → Models**. Future models and price
+changes do not require a plugin update.
 
-| Standard, input ≤272K | Input | Cached input | Cache write | Output/reasoning |
-| --------------------- | ----: | -----------: | ----------: | ---------------: |
-| Sol                   | $5.00 |        $0.50 |       $6.25 |           $30.00 |
-| Terra                 | $2.50 |        $0.25 |      $3.125 |           $15.00 |
-| Luna                  | $1.00 |        $0.10 |       $1.25 |            $6.00 |
+When upgrading from 0.2.8, update the plugin once to stop sending its old prices.
+Langfuse gives ingested costs precedence over model definitions, so changing
+server prices alone does not replace amounts from an old plugin.
 
-| Standard, input >272K |  Input | Cached input | Cache write | Output/reasoning |
-| --------------------- | -----: | -----------: | ----------: | ---------------: |
-| Sol                   | $10.00 |        $1.00 |      $12.50 |           $45.00 |
-| Terra                 |  $5.00 |        $0.50 |       $6.25 |           $22.50 |
-| Luna                  |  $2.00 |        $0.20 |       $2.50 |            $9.00 |
+Define prices for these exact, mutually exclusive usage keys:
 
-Service-mode and location adjustments are applied after selecting the model/context row:
+| Usage key | Meaning |
+| --- | --- |
+| `input` | Input excluding cached reads and cache writes |
+| `input_cached` | Cached input reads |
+| `input_cache_write` | Cache writes, when Codex supplies them |
+| `output` | Output excluding reasoning |
+| `output_reasoning` | Reasoning output, normally priced at the output rate |
 
-| Mode/location       | Multiplier | Notes                                 |
-| ------------------- | ---------: | ------------------------------------- |
-| Standard            |       1.0× | Default                               |
-| Batch               |       0.5× | Short and long context                |
-| Flex                |       0.5× | Short and long context                |
-| Priority            |       2.0× | Short context only                    |
-| Regional processing |       1.1× | Applied in addition to the mode above |
+Do not price `total` alongside these buckets. Context thresholds must sum
+`^input` keys, including cached reads and cache writes. Current Codex uses
+per-response `token_usage_record`; older versions use `token_count`.
 
-If Codex records `service_tier` in the rollout, that observed value overrides `pricing_mode`; otherwise set `LANGFUSE_CODEX_PRICING_MODE` (or `pricing_mode` in JSON) to match the API route. Enable `regional_processing` only when that OpenAI option is actually used. Unsupported combinations such as Priority with >272K input omit explicit cost instead of inventing a price.
+Custom models are project-scoped: configure every independent project.
+Prices apply to new ingestion; this change does not replay old turns.
+Missing model prices remain missing amounts until configured.
 
-Reasoning effort (`low`, `medium`, `high`, and so on) does not change the per-token rate. Reasoning tokens are a subset of output tokens and are charged at the selected model's output rate. Cached input and cache-write tokens are subtracted from the inclusive input total before costs are calculated, preventing double billing.
+Service-mode and regional-processing hints are preserved without applying
+multipliers. Langfuse must support and configure those conditions. Versions
+supporting only usage-based tiers can provide Standard-price reference costs,
+but cannot infer service-mode premiums from those hints.
+For ChatGPT subscriptions these are reference costs, not subscription charges.
 
-Source: [OpenAI API pricing](https://developers.openai.com/api/docs/pricing).
+See [Langfuse cost tracking](https://langfuse.com/docs/observability/features/token-and-cost-tracking).
 
 ## Deterministic trace ids
 
@@ -255,8 +260,8 @@ The default root is `$CODEX_HOME/cctrace/support-context` (or
 | `metadata`            | `LANGFUSE_CODEX_METADATA`                                     | —                                     | Metadata object for all traces    |
 | `trace_seed`          | `LANGFUSE_CODEX_TRACE_SEED`                                   | —                                     | Deterministic trace-id seed       |
 | `support_context_dir` | `LANGFUSE_CODEX_SUPPORT_CONTEXT_DIR`                          | `$CODEX_HOME/cctrace/support-context` | CloseClaw per-turn context root   |
-| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                            | OpenAI service pricing mode       |
-| `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                               | Add regional-processing surcharge |
+| `pricing_mode`        | `LANGFUSE_CODEX_PRICING_MODE`                                 | `standard`                            | Service-mode hint for Langfuse       |
+| `regional_processing` | `LANGFUSE_CODEX_REGIONAL_PROCESSING`                          | `false`                               | Regional-processing hint for Langfuse |
 | `max_chars`           | `LANGFUSE_CODEX_MAX_CHARS`                                    | `20000`                               | Input/output truncation threshold |
 | `debug`               | `LANGFUSE_CODEX_DEBUG`                                        | `false`                               | Verbose logging                   |
 | `fail_on_error`       | `LANGFUSE_CODEX_FAIL_ON_ERROR`                                | `false`                               | Fail the hook on upload errors    |

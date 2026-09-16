@@ -115,36 +115,42 @@ describe("convertRollout", () => {
     expect(generations.map((g) => g.spanContext().spanId)).toContain(parentId(tools[0]));
   });
 
-  it("emits explicit GPT-5.6 cost details and auditable pricing metadata", async () => {
-    const dir = stageFixtures();
-    const file = path.join(dir, "rollout-basic-main.jsonl");
-    const rollout = fs.readFileSync(file, "utf-8").replaceAll("gpt-5.4", "gpt-5.6-sol");
-    fs.writeFileSync(file, rollout);
-
-    await convertRollout(file, { config: baseConfig });
-
-    const generation = exporter
-      .getFinishedSpans()
-      .filter((span) => obsType(span) === "generation")
-      .find((span) => attr(span, "langfuse.observation.usage_details").includes("120"));
-    expect(generation).toBeDefined();
-
-    const costs = JSON.parse(attr(generation!, "langfuse.observation.cost_details")) as Record<
-      string,
-      number
-    >;
-    expect(costs.input).toBeCloseTo(0.0005, 12);
-    expect(costs.input_cached).toBe(0);
-    expect(costs.output).toBeCloseTo(0.00045, 12);
-    expect(costs.output_reasoning).toBeCloseTo(0.00015, 12);
-    expect(costs.total).toBeCloseTo(0.0011, 12);
-    expect(attr(generation!, "langfuse.observation.metadata.cctrace.pricing_source")).toBe(
-      "openai-official-2026-07-09",
-    );
-    expect(attr(generation!, "langfuse.observation.metadata.cctrace.pricing_mode")).toBe(
-      "standard",
-    );
-  });
+  it.each(["gpt-5.6-sol", "gpt-6-astra", "future-model-unknown-to-plugin"])(
+    "exports %s usage for Langfuse pricing without a client price table",
+    async (model) => {
+      const dir = stageFixtures();
+      const file = path.join(dir, "rollout-basic-main.jsonl");
+      fs.writeFileSync(file, fs.readFileSync(file, "utf-8").replaceAll("gpt-5.4", model));
+      await convertRollout(file, { config: { ...baseConfig, pricing_mode: "fast" } });
+      const generations = exporter
+        .getFinishedSpans()
+        .filter((span) => obsType(span) === "generation");
+      expect(generations.length).toBeGreaterThan(0);
+      for (const generation of generations) {
+        expect(attr(generation, "langfuse.observation.model.name")).toBe(model);
+        expect(generation.attributes).not.toHaveProperty("langfuse.observation.cost_details");
+        expect(attr(generation, "langfuse.observation.metadata.cctrace.pricing_source")).toBe(
+          "langfuse-model-definition",
+        );
+        expect(attr(generation, "langfuse.observation.metadata.cctrace.cost_calculation")).toBe(
+          "langfuse",
+        );
+        expect(JSON.parse(attr(generation, "langfuse.observation.model.parameters"))).toEqual({
+          service_tier: "fast",
+        });
+      }
+      const usage = generations
+        .map((g) => JSON.parse(attr(g, "langfuse.observation.usage_details")))
+        .find((u) => u.total === 120);
+      expect(usage).toEqual({
+        input: 100,
+        input_cached: 0,
+        output: 15,
+        output_reasoning: 5,
+        total: 120,
+      });
+    },
+  );
 
   it("nests subagent turns under the spawning turn and marks errors/interruptions", async () => {
     const dir = stageFixtures();
@@ -544,8 +550,7 @@ describe("reasoning archives", () => {
       { id: "call-1", name: "exec_command", arguments: { command: ["ls"] } },
     ]);
     expect(attr(generation, "langfuse.observation.metadata.cctrace.reasoning_schema")).toBe("1");
-    const costs = JSON.parse(attr(generation, "langfuse.observation.cost_details"));
-    expect(costs.total).toBeCloseTo(0.0011, 12);
+    expect(generation.attributes).not.toHaveProperty("langfuse.observation.cost_details");
     exporter.reset();
     await convertRollout(file, { config });
     expect(exporter.getFinishedSpans()).toHaveLength(0);
@@ -613,4 +618,42 @@ describe("per-turn export backpressure", () => {
     expect(fs.existsSync(file + ".langfuse")).toBe(false);
     expect(fs.existsSync(file + ".langfuse.state.json")).toBe(false);
   });
+});
+
+it("carries native response identity through streaming conversion to Langfuse", async () => {
+  const dir = stageFixtures();
+  const file = path.join(dir, "rollout-basic-main.jsonl");
+  let responseNumber = 0;
+  const lines = fs
+    .readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .flatMap((raw) => {
+      const entry = JSON.parse(raw);
+      if (entry.type !== "event_msg" || entry.payload.type !== "token_count") return [entry];
+      return [
+        {
+          timestamp: entry.timestamp,
+          type: "token_usage_record",
+          payload: {
+            thread_id: "sess-basic",
+            turn_id: "turn-1",
+            response_id: `resp-${++responseNumber}`,
+            usage: entry.payload.info.last_token_usage,
+          },
+        },
+        entry,
+      ];
+    });
+  fs.writeFileSync(file, lines.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  await convertRollout(file, { config: baseConfig });
+  const generations = exporter.getFinishedSpans().filter((span) => obsType(span) === "generation");
+  expect(generations).toHaveLength(2);
+  expect(
+    generations.map((span) => attr(span, "langfuse.observation.metadata.codex.response_id")),
+  ).toEqual(["resp-1", "resp-2"]);
+  for (const generation of generations) {
+    expect(attr(generation, "langfuse.observation.metadata.codex.thread_id")).toBe("sess-basic");
+    expect(attr(generation, "langfuse.observation.metadata.codex.turn_id")).toBe("turn-1");
+  }
 });

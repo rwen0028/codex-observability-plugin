@@ -4338,7 +4338,8 @@ const ConfigSchema = object({
 		"standard",
 		"batch",
 		"flex",
-		"priority"
+		"priority",
+		"fast"
 	]),
 	regional_processing: boolean(),
 	max_chars: number().int().positive(),
@@ -46828,36 +46829,13 @@ function uint8ArrayToHex(array$1) {
 
 //#endregion
 //#region src/pricing.ts
-const PER_MILLION = 1e6;
-const LONG_CONTEXT_THRESHOLD = 272e3;
-/** Official OpenAI prices, USD per 1M tokens, published 2026-07-09. */
-const GPT_56_STANDARD_SHORT = {
-	sol: {
-		input: 5,
-		input_cached: .5,
-		input_cache_write: 6.25,
-		output: 30
-	},
-	terra: {
-		input: 2.5,
-		input_cached: .25,
-		input_cache_write: 3.125,
-		output: 15
-	},
-	luna: {
-		input: 1,
-		input_cached: .1,
-		input_cache_write: 1.25,
-		output: 6
-	}
-};
 function nonNegative(value) {
 	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 /**
 * Codex reports inclusive input/output totals plus cached/reasoning subsets.
 * Langfuse requires arbitrary usage buckets to be mutually exclusive, so split
-* the inclusive totals before sending either usage or cost details.
+* the inclusive totals before sending usage details for server-side cost inference.
 */
 function normalizeUsage(usage) {
 	if (!usage) return void 0;
@@ -46875,64 +46853,13 @@ function normalizeUsage(usage) {
 	if (typeof usage.total_tokens === "number") details.total = nonNegative(usage.total_tokens);
 	return Object.keys(details).length > 0 ? details : void 0;
 }
-function modelTier(model) {
-	const normalized = model?.toLowerCase().replace(/^openai\//, "");
-	if (normalized === "gpt-5.6" || normalized === "gpt-5.6-sol") return "sol";
-	if (normalized === "gpt-5.6-terra") return "terra";
-	if (normalized === "gpt-5.6-luna") return "luna";
-}
 function pricingMode(turn, configured) {
 	const raw = turn.invocationParams?.service_tier ?? turn.invocationParams?.serviceTier;
 	if (typeof raw !== "string") return configured;
 	const normalized = raw.toLowerCase();
-	if (normalized === "priority" || normalized === "flex" || normalized === "batch") return normalized;
+	if (normalized === "priority" || normalized === "fast" || normalized === "flex" || normalized === "batch") return normalized;
 	if (normalized === "default" || normalized === "standard" || normalized === "auto") return "standard";
 	return configured;
-}
-function modeMultiplier(mode) {
-	if (mode === "batch" || mode === "flex") return .5;
-	if (mode === "priority") return 2;
-	return 1;
-}
-/**
-* Calculate official-list-price cost details for GPT-5.6 generations.
-*
-* Priority does not support >272K long-context requests. If such a combination
-* appears, omit explicit cost instead of silently inventing a price.
-*/
-function calculateGpt56Cost(model, usage, turn, options) {
-	const tier = modelTier(model);
-	if (!tier || !usage) return void 0;
-	const contextTier = nonNegative(usage.input) + nonNegative(usage.input_cached) + nonNegative(usage.input_cache_write) > LONG_CONTEXT_THRESHOLD ? "long" : "short";
-	const mode = pricingMode(turn, options.mode);
-	if (mode === "priority" && contextTier === "long") return void 0;
-	const base = GPT_56_STANDARD_SHORT[tier];
-	const processingMultiplier = modeMultiplier(mode);
-	const regionalMultiplier = options.regionalProcessing ? 1.1 : 1;
-	const inputContextMultiplier = contextTier === "long" ? 2 : 1;
-	const outputContextMultiplier = contextTier === "long" ? 1.5 : 1;
-	const prices = {
-		input: base.input * inputContextMultiplier,
-		input_cached: base.input_cached * inputContextMultiplier,
-		input_cache_write: base.input_cache_write * inputContextMultiplier,
-		output: base.output * outputContextMultiplier,
-		output_reasoning: base.output * outputContextMultiplier
-	};
-	const costDetails = {};
-	let totalCost = 0;
-	for (const [usageType, units] of Object.entries(usage)) {
-		if (usageType === "total" || prices[usageType] == null) continue;
-		const cost = units * prices[usageType] * processingMultiplier * regionalMultiplier / PER_MILLION;
-		costDetails[usageType] = cost;
-		totalCost += cost;
-	}
-	if (Object.keys(costDetails).length > 0) costDetails.total = totalCost;
-	return {
-		costDetails,
-		mode,
-		contextTier,
-		regionalProcessing: options.regionalProcessing
-	};
 }
 function reasoningEffort(turn) {
 	const direct = turn.invocationParams?.effort ?? turn.invocationParams?.reasoning_effort;
@@ -47048,17 +46975,33 @@ function newTurn(startTime) {
 *
 * Codex interleaves model I/O (`response_item`) with lifecycle events
 * (`event_msg`). We reconstruct each turn as a sequence of model steps (one per
-* model response, delimited by `token_count` events) plus the tool calls each
+* model response, delimited by native `token_usage_record` records or
+* legacy `token_count` events) plus the tool calls each
 * step issued. Tool execution details (status, exit code, output) arrive later
 * as `*_end` events and are matched back to their call by `call_id`.
 */
-function parseSession(lines) {
-	let sessionMeta = { sessionId: "unknown" };
+function parseSession(lines, initialSessionMeta) {
+	let sessionMeta = initialSessionMeta ?? { sessionId: "unknown" };
 	const turns = [];
 	let turn = null;
 	let step = null;
 	let toolCallsById = /* @__PURE__ */ new Map();
 	let lastTimestamp = Date.now();
+	const persistedSessionId = (lines.find((line) => line.type === "session_meta")?.payload)?.id ?? initialSessionMeta?.sessionId;
+	const nativeRecords = new Set(lines.filter((line) => {
+		if (line.type !== "token_usage_record") return false;
+		const p = line.payload;
+		return typeof p.turn_id === "string" && p.turn_id.length > 0 && typeof p.response_id === "string" && p.response_id.length > 0 && typeof p.thread_id === "string" && p.thread_id.length > 0 && (typeof persistedSessionId !== "string" || p.thread_id === persistedSessionId) && p.usage != null && typeof p.usage === "object" && !Array.isArray(p.usage) && [
+			"input_tokens",
+			"output_tokens",
+			"total_tokens"
+		].every((key) => {
+			const value = p.usage[key];
+			return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+		});
+	}));
+	const nativeTurnIds = new Set([...nativeRecords].map((line) => line.payload.turn_id));
+	let responseIds = /* @__PURE__ */ new Set();
 	function newStep(startTime) {
 		return {
 			startTime,
@@ -47089,6 +47032,7 @@ function parseSession(lines) {
 		turns.push(turn);
 		turn = null;
 		toolCallsById = /* @__PURE__ */ new Map();
+		responseIds = /* @__PURE__ */ new Set();
 	};
 	for (const line of lines) {
 		const ts = Number.isFinite(Date.parse(line.timestamp)) ? Date.parse(line.timestamp) : lastTimestamp;
@@ -47108,6 +47052,15 @@ function parseSession(lines) {
 			const t = ensureTurn(ts);
 			t.model = line.payload.model ?? t.model;
 			t.invocationParams = line.payload;
+			continue;
+		}
+		if (line.type === "token_usage_record") {
+			const p = line.payload;
+			if (!nativeRecords.has(line) || !turn || p.turn_id !== turn.turnId || responseIds.has(p.response_id)) continue;
+			responseIds.add(p.response_id);
+			const s = ensureStep(ts);
+			s.responseId = p.response_id;
+			closeStep(ts, p.usage);
 			continue;
 		}
 		const record$1 = reasoningRecord(line);
@@ -47208,7 +47161,7 @@ function parseSession(lines) {
 			} else if (et === "agent_message" && typeof p.message === "string") turn.lastAgentMessage = p.message;
 			else if (et === "token_count") {
 				if (p.info?.total_token_usage) turn.totalUsage = p.info.total_token_usage;
-				closeStep(ts, p.info?.last_token_usage ?? void 0);
+				if (!turn.turnId || !nativeTurnIds.has(turn.turnId)) closeStep(ts, p.info?.last_token_usage ?? void 0);
 			} else if (et === "task_complete") finishTurn(ts, {
 				completed: true,
 				aborted: false
@@ -47372,8 +47325,8 @@ async function scanCompleteLines(file, startOffset, snapshotBytes, lineLimit, on
 function hasContent(turn) {
 	return turn.userInput != null || turn.finalOutput != null || turn.steps.length > 0 || turn.subagentThreadIds.length > 0;
 }
-function selectTurn(active) {
-	const turns = parseSession(active.lines).turns;
+function selectTurn(active, sessionMeta) {
+	const turns = parseSession(active.lines, sessionMeta).turns;
 	if (active.turnId) {
 		const matched = turns.find((turn) => turn.turnId === active.turnId);
 		if (matched && hasContent(matched)) return matched;
@@ -47406,7 +47359,7 @@ async function scanRollout(rolloutFile, options) {
 			skippedTurns++;
 			return;
 		}
-		const turn = selectTurn(current);
+		const turn = selectTurn(current, sessionMeta);
 		const ready = !trailing || current.completed || current.finalOutputSeen || turn?.aborted === true;
 		if (turn && ready) await options.onTurn({
 			turn,
@@ -47529,7 +47482,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.8";
+var version = "0.2.9";
 
 //#endregion
 //#region src/version.ts
@@ -47544,7 +47497,7 @@ init_esm$2();
 * produced them: a trace without this field came from a plugin build that
 * still traces each turn more than once.
 */
-const TRACE_PATCH_VERSION = "2.4.2";
+const TRACE_PATCH_VERSION = "2.5.0";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *
@@ -47673,27 +47626,25 @@ async function emitTurn(turn, sessionMeta, ctx) {
 	for (let i = 0; i < turn.steps.length; i++) {
 		const step = turn.steps[i];
 		const usageDetails = toUsageDetails(step.usage);
-		const pricing = calculateGpt56Cost(turn.model, usageDetails, turn, {
-			mode: ctx.config.pricing_mode,
-			regionalProcessing: ctx.config.regional_processing
-		});
+		const mode = pricingMode(turn, ctx.config.pricing_mode);
 		const effort = reasoningEffort(turn);
 		const generation = startObservation(isSubagent ? "LLM Subagent" : "LLM", {
 			input: i === 0 ? turn.userInput != null ? clip(turn.userInput) : void 0 : previousToolResults,
 			output: buildGenerationOutput(step, clip),
 			model: turn.model,
 			usageDetails,
-			costDetails: pricing?.costDetails,
+			modelParameters: { service_tier: mode },
 			metadata: {
 				"codex.step_index": i,
+				"codex.response_id": step.responseId,
+				"codex.thread_id": sessionMeta.sessionId,
+				"codex.turn_id": turn.turnId,
 				"cctrace.reasoning_schema": 1,
 				...effort ? { "codex.reasoning_effort": effort } : {},
-				...pricing ? {
-					"cctrace.pricing_source": "openai-official-2026-07-09",
-					"cctrace.pricing_mode": pricing.mode,
-					"cctrace.pricing_context": pricing.contextTier,
-					"cctrace.pricing_regional": pricing.regionalProcessing
-				} : {}
+				"cctrace.pricing_source": "langfuse-model-definition",
+				"cctrace.cost_calculation": "langfuse",
+				"cctrace.pricing_mode": mode,
+				"cctrace.pricing_regional": ctx.config.regional_processing
 			}
 		}, {
 			asType: "generation",

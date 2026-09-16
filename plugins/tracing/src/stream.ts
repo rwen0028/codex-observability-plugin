@@ -187,8 +187,8 @@ function hasContent(turn: Turn): boolean {
   );
 }
 
-function selectTurn(active: ActiveTurn): Turn | undefined {
-  const turns = parseSession(active.lines).turns;
+function selectTurn(active: ActiveTurn, sessionMeta: SessionMeta): Turn | undefined {
+  const turns = parseSession(active.lines, sessionMeta).turns;
   if (active.turnId) {
     const matched = turns.find((turn) => turn.turnId === active.turnId);
     if (matched && hasContent(matched)) return matched;
@@ -232,7 +232,7 @@ export async function scanRollout(
       skippedTurns++;
       return;
     }
-    const turn = selectTurn(current);
+    const turn = selectTurn(current, sessionMeta);
     const ready =
       !trailing || current.completed || current.finalOutputSeen || turn?.aborted === true;
     if (turn && ready) {
