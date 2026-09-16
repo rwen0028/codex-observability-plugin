@@ -19,11 +19,12 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-function readHookCommand(): string {
+function readHookCommand(platform = process.platform): string {
   const config = JSON.parse(fs.readFileSync(hookConfigFile, "utf-8")) as {
-    hooks: { Stop: Array<{ hooks: Array<{ command: string }> }> };
+    hooks: { Stop: Array<{ hooks: Array<{ command: string; commandWindows?: string }> }> };
   };
-  return config.hooks.Stop[0].hooks[0].command;
+  const hook = config.hooks.Stop[0].hooks[0];
+  return platform === "win32" ? (hook.commandWindows ?? hook.command) : hook.command;
 }
 
 function runShellCommand(
@@ -67,35 +68,40 @@ afterEach(() => {
 });
 
 describe("bundled Stop hook command", () => {
-  it("runs from an arbitrary session cwd via the Codex-provided PLUGIN_ROOT", async () => {
-    const codexHome = makeTempDir("lf-codex-home-");
-    const sessionCwd = makeTempDir("lf-codex-cwd-");
+  it.each([process.platform, ...(process.platform === "win32" ? [] : ["win32" as const])])(
+    "runs the %s launcher from an arbitrary session cwd via PLUGIN_ROOT",
+    async (platform) => {
+      const codexHome = makeTempDir("lf-codex-home-");
+      const sessionCwd = makeTempDir("lf-codex-cwd-");
 
-    const { code, stderr, stdout } = await runShellCommand(readHookCommand(), {
-      cwd: sessionCwd,
-      env: {
-        ...process.env,
-        PLUGIN_ROOT: path.join(repoRoot, "plugins/tracing"),
-        CODEX_HOME: codexHome,
-        HOME: codexHome,
-      },
-      input: JSON.stringify({
-        hook_event_name: "Stop",
-        transcript_path: path.join(sessionCwd, "rollout.jsonl"),
-      }),
-    });
+      const { code, stderr, stdout } = await runShellCommand(readHookCommand(platform), {
+        cwd: sessionCwd,
+        env: {
+          ...process.env,
+          PLUGIN_ROOT: path.join(repoRoot, "plugins/tracing"),
+          CODEX_HOME: codexHome,
+          HOME: codexHome,
+        },
+        input: JSON.stringify({
+          hook_event_name: "Stop",
+          transcript_path: path.join(sessionCwd, "rollout.jsonl"),
+        }),
+      });
 
-    expect(code).toBe(0);
-    expect(stdout).toBe("");
-    expect(stderr).toBe("");
-  });
+      expect(code).toBe(0);
+      expect(stdout).toBe("");
+      expect(stderr).toBe("");
+    },
+  );
 
   it("does not depend on the old marketplace-root relative path", () => {
     expect(readHookCommand()).not.toContain("plugins/cache/");
   });
 
   it("keeps an identical trusted command across plugin versions", () => {
-    expect(readHookCommand()).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
+    expect(readHookCommand("linux")).toBe('node "${PLUGIN_ROOT}/dist/index.mjs"');
+    expect(readHookCommand("win32")).toContain("process.env.PLUGIN_ROOT");
+    expect(readHookCommand("win32")).not.toContain("${PLUGIN_ROOT}");
     expect(readHookCommand()).not.toMatch(/\d+\.\d+\.\d+/);
   });
 

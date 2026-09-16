@@ -46276,17 +46276,17 @@ const statusPath = (rolloutFile) => `${rolloutFile}.langfuse.status.json`;
 const lockPath = (rolloutFile) => `${rolloutFile}.langfuse.lock`;
 async function writeJsonAtomic(file, value) {
 	const temporary = `${file}.tmp.${process.pid}.${Date.now()}`;
-	await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
-		encoding: "utf-8",
-		mode: 384
-	});
-	const handle = await fs.open(temporary, "r");
 	try {
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	try {
+		await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
+			encoding: "utf-8",
+			mode: 384
+		});
+		const handle = await fs.open(temporary, "r+");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
 		await fs.rename(temporary, file);
 		await fs.chmod(file, 384);
 	} catch (error) {
@@ -47514,7 +47514,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.10";
+var version = "0.2.11";
 
 //#endregion
 //#region src/version.ts
@@ -47528,7 +47528,7 @@ init_esm$2();
 * Diagnostic build marker. Delivery idempotency comes from stable observation
 * identities, not from the presence of a version field.
 */
-const TRACE_PATCH_VERSION = "2.5.1";
+const TRACE_PATCH_VERSION = "2.5.2";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *

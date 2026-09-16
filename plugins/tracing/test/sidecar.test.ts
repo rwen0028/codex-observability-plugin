@@ -25,6 +25,13 @@ function makeRollout(): string {
   return file;
 }
 
+function expectSidecarPermissions(file: string): void {
+  const mode = fs.statSync(file).mode;
+  expect(mode & 0o200).toBe(0o200);
+  // Windows uses ACLs; Node chmod cannot enforce POSIX owner/group mode bits.
+  if (process.platform !== "win32") expect(mode & 0o777).toBe(0o600);
+}
+
 afterEach(() => {
   while (tmpDirs.length > 0) fs.rmSync(tmpDirs.pop()!, { recursive: true, force: true });
 });
@@ -35,7 +42,7 @@ describe("v2 upload sidecars", () => {
     await markTurnsUploaded(file, ["turn-1", "turn-2"]);
 
     expect(await loadUploadedTurnIds(file)).toEqual(new Set(["turn-1", "turn-2"]));
-    expect(fs.statSync(`${file}.langfuse`).mode & 0o777).toBe(0o600);
+    expectSidecarPermissions(`${file}.langfuse`);
   });
 
   it("loads state only for the same rollout inode and a valid offset", async () => {
@@ -52,7 +59,7 @@ describe("v2 upload sidecars", () => {
     await writeUploadState(file, state);
 
     expect(await loadUploadState(file, stat)).toEqual(state);
-    expect(fs.statSync(`${file}.langfuse.state.json`).mode & 0o777).toBe(0o600);
+    expectSidecarPermissions(`${file}.langfuse.state.json`);
     expect(await loadUploadState(file, { ...stat, ino: Number(stat.ino) + 1 })).toBeUndefined();
     expect(await loadUploadState(file, { ...stat, size: stat.size - 1 })).toBeUndefined();
   });
@@ -71,7 +78,7 @@ describe("v2 upload sidecars", () => {
     expect(raw).not.toContain("do-not-log");
     expect(raw).not.toContain("also-secret");
     expect(raw.length).toBeLessThan(700);
-    expect(fs.statSync(`${file}.langfuse.status.json`).mode & 0o777).toBe(0o600);
+    expectSidecarPermissions(`${file}.langfuse.status.json`);
   });
 
   it("serializes workers and recovers a lock left by a dead pid", async () => {

@@ -38,17 +38,18 @@ const lockPath = (rolloutFile: string) => `${rolloutFile}.langfuse.lock`;
 
 async function writeJsonAtomic(file: string, value: unknown): Promise<void> {
   const temporary = `${file}.tmp.${process.pid}.${Date.now()}`;
-  await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
-  const handle = await fs.open(temporary, "r");
   try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+    // Windows FlushFileBuffers requires a handle opened with write access.
+    const handle = await fs.open(temporary, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fs.rename(temporary, file);
     await fs.chmod(file, 0o600);
   } catch (error) {
