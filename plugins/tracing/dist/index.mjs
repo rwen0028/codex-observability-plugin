@@ -4319,7 +4319,10 @@ const meta = meta$1;
 * Resolved tracer configuration.
 *
 * Resolution order (lowest → highest precedence):
-*   defaults  →  ~/.codex/langfuse.json  →  <cwd>/.codex/langfuse.json  →  env
+*   defaults  →  <CODEX_HOME>/langfuse.json  →  <cwd>/.codex/langfuse.json  →  env
+*
+* CODEX_HOME defaults to ~/.codex. An explicit home does not inherit that
+* default directory's config or credentials.
 *
 * For each env var, the `LANGFUSE_CODEX_*` form takes precedence over the
 * matching standard `LANGFUSE_*` form so you can scope credentials to Codex
@@ -4482,7 +4485,8 @@ async function getConfig(options) {
 	const cwd = options?.cwd ?? process.cwd();
 	const env = options?.env ?? process.env;
 	const codexHome = getCodexHome(home, env);
-	const [globalConfig$1, localConfig] = await Promise.all([readConfigFile(path.join(home, ".codex", "langfuse.json")), readConfigFile(path.join(cwd, ".codex", "langfuse.json"))]);
+	const localConfigFile = path.join(cwd, ".codex", "langfuse.json");
+	const [globalConfig$1, localConfig] = await Promise.all([readConfigFile(path.join(codexHome, "langfuse.json")), path.resolve(localConfigFile) === path.resolve(home, ".codex", "langfuse.json") ? void 0 : readConfigFile(localConfigFile)]);
 	const envConfig = readEnvConfig(env);
 	const codexUserId = globalConfig$1?.user_id ?? localConfig?.user_id ?? envConfig.user_id ? void 0 : await readCodexUserEmail(path.join(codexHome, "auth.json"));
 	return ConfigSchema.parse({
@@ -47514,7 +47518,7 @@ async function loadSupportTraceContext(root, threadId, turnId) {
 
 //#endregion
 //#region ../../package.json
-var version = "0.2.12";
+var version = "0.2.13";
 
 //#endregion
 //#region src/version.ts
@@ -47528,7 +47532,7 @@ init_esm$2();
 * Diagnostic build marker. Delivery idempotency comes from stable observation
 * identities, not from the presence of a version field.
 */
-const TRACE_PATCH_VERSION = "2.5.3";
+const TRACE_PATCH_VERSION = "2.5.4";
 /**
 * Resolve a subagent's rollout file from its thread id.
 *

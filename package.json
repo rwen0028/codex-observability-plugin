@@ -1,6 +1,6 @@
 {
   "name": "@langfuse/codex-observability-plugin",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "OpenAI Codex plugin that traces agent turns, tool calls, and subagents to Langfuse",
   "keywords": [
     "codex",

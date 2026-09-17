@@ -10,7 +10,10 @@ import type { PricingMode } from "./pricing.js";
  * Resolved tracer configuration.
  *
  * Resolution order (lowest → highest precedence):
- *   defaults  →  ~/.codex/langfuse.json  →  <cwd>/.codex/langfuse.json  →  env
+ *   defaults  →  <CODEX_HOME>/langfuse.json  →  <cwd>/.codex/langfuse.json  →  env
+ *
+ * CODEX_HOME defaults to ~/.codex. An explicit home does not inherit that
+ * default directory's config or credentials.
  *
  * For each env var, the `LANGFUSE_CODEX_*` form takes precedence over the
  * matching standard `LANGFUSE_*` form so you can scope credentials to Codex
@@ -235,9 +238,14 @@ export async function getConfig(options?: {
   const env = options?.env ?? process.env;
   const codexHome = getCodexHome(home, env);
 
+  const localConfigFile = path.join(cwd, ".codex", "langfuse.json");
   const [globalConfig, localConfig] = await Promise.all([
-    readConfigFile(path.join(home, ".codex", "langfuse.json")),
-    readConfigFile(path.join(cwd, ".codex", "langfuse.json")),
+    readConfigFile(path.join(codexHome, "langfuse.json")),
+    // Starting in the user's home must not reintroduce the default global
+    // credentials as a project override when CODEX_HOME selects another home.
+    path.resolve(localConfigFile) === path.resolve(home, ".codex", "langfuse.json")
+      ? undefined
+      : readConfigFile(localConfigFile),
   ]);
   const envConfig = readEnvConfig(env);
   const explicitUserId = globalConfig?.user_id ?? localConfig?.user_id ?? envConfig.user_id;

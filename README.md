@@ -75,7 +75,8 @@ export LANGFUSE_BASE_URL="https://cloud.langfuse.com" # 🇪🇺 EU (default)
 
 **Option 2: JSON config file**
 
-Create `~/.codex/langfuse.json` (global) or `<project>/.codex/langfuse.json` (per-project):
+Create `$CODEX_HOME/langfuse.json` (global, default `~/.codex/langfuse.json`) or
+`<project>/.codex/langfuse.json` (per-project):
 
 ```json
 {
@@ -88,7 +89,29 @@ Create `~/.codex/langfuse.json` (global) or `<project>/.codex/langfuse.json` (pe
 }
 ```
 
-Config is resolved as **defaults → `~/.codex/langfuse.json` → `<project>/.codex/langfuse.json` → environment variables** (environment wins). `LANGFUSE_CODEX_*` variables take precedence over the matching standard `LANGFUSE_*` variables, so you can scope credentials to Codex without disturbing other Langfuse tooling.
+Config is resolved as **defaults → `$CODEX_HOME/langfuse.json` → `<project>/.codex/langfuse.json` → environment variables** (environment wins). `LANGFUSE_CODEX_*` variables take precedence over the matching standard `LANGFUSE_*` variables, so you can scope credentials to Codex without disturbing other Langfuse tooling.
+
+### Use a dedicated Codex home
+
+From version 0.2.13, setting `CODEX_HOME` also selects the global Langfuse config.
+For example, SolidAgent can launch Codex with:
+
+```bash
+CODEX_HOME="/Users/mikewen/.solidagent/codex-home/default" codex
+```
+
+Put `langfuse.json` directly in that directory. The installer and the Codex process
+must receive the same `CODEX_HOME`; the background uploader inherits it.
+The plugin already reads `auth.json` and support context from this selected home.
+
+An unset or blank `CODEX_HOME` keeps the default `~/.codex` behavior. A selected
+home does not merge or fall back to `~/.codex/langfuse.json`, even if its own config
+is missing or invalid. Starting Codex with the user's home directory as cwd does
+not turn that default global file into a project override.
+
+Explicit per-project config and Langfuse environment variables still have higher
+priority. For a dedicated SolidAgent setup, keep those overrides scoped to the
+same Langfuse project, or rely on the dedicated home's config alone.
 
 ### 4. Get your Langfuse API keys
 

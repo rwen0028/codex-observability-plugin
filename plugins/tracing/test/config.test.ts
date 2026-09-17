@@ -63,6 +63,125 @@ describe("getConfig", () => {
     expect(overridden.support_context_dir).toBe(explicit);
   });
 
+  it("uses the selected Codex home without merging the default home configuration", async () => {
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: {
+        enabled: false,
+        public_key: "pk-default",
+        secret_key: "sk-default",
+        base_url: "https://default.invalid",
+        tags: ["ordinary-codex"],
+        metadata: { source: "default-home" },
+        trace_seed: "default-seed",
+      },
+    });
+    const codexHome = path.join(home, ".solidagent", "codex-home", "default");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(codexHome, "langfuse.json"),
+      JSON.stringify({
+        enabled: true,
+        public_key: "pk-solidagent",
+        secret_key: "sk-solidagent",
+        base_url: "https://solidagent.invalid",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(codexHome, "auth.json"),
+      JSON.stringify({
+        tokens: { id_token: makeJwt({ email: "solidagent@example.invalid" }) },
+      }),
+    );
+    const config = await getConfig({ home, cwd: emptyHome(), env: { CODEX_HOME: codexHome } });
+    expect(config).toMatchObject({
+      enabled: true,
+      public_key: "pk-solidagent",
+      secret_key: "sk-solidagent",
+      base_url: "https://solidagent.invalid",
+      user_id: "solidagent@example.invalid",
+      support_context_dir: path.join(codexHome, "cctrace", "support-context"),
+    });
+    expect(config.tags).toBeUndefined();
+    expect(config.metadata).toBeUndefined();
+    expect(config.trace_seed).toBeUndefined();
+  });
+
+  it.each(["missing", "invalid", "partial"])(
+    "does not fall back to ordinary Codex credentials when the selected config is %s",
+    async (scenario) => {
+      const home = makeTmpHome({
+        rel: ".codex/langfuse.json",
+        contents: { enabled: true, public_key: "pk-default", secret_key: "sk-default" },
+      });
+      const codexHome = emptyHome();
+      if (scenario !== "missing") {
+        fs.writeFileSync(
+          path.join(codexHome, "langfuse.json"),
+          scenario === "invalid"
+            ? "{ broken"
+            : JSON.stringify({ enabled: true, public_key: "pk-isolated" }),
+        );
+      }
+      const config = await getConfig({ home, cwd: emptyHome(), env: { CODEX_HOME: codexHome } });
+      expect(config.secret_key).toBeUndefined();
+      expect(config.public_key).toBe(scenario === "partial" ? "pk-isolated" : undefined);
+      expect(config.enabled).toBe(scenario === "partial");
+    },
+  );
+
+  it("does not reinterpret the default global config as project config when cwd is the user home", async () => {
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { enabled: true, public_key: "pk-default", secret_key: "sk-default" },
+    });
+    const config = await getConfig({ home, cwd: home, env: { CODEX_HOME: emptyHome() } });
+    expect(config.enabled).toBe(false);
+    expect(config.public_key).toBeUndefined();
+    expect(config.secret_key).toBeUndefined();
+  });
+
+  it.each(["", "   "])("keeps the default home when CODEX_HOME is blank (%j)", async (value) => {
+    const home = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { enabled: true, public_key: "pk-default", secret_key: "sk-default" },
+    });
+    const config = await getConfig({ home, cwd: home, env: { CODEX_HOME: value } });
+    expect(config).toMatchObject({
+      enabled: true,
+      public_key: "pk-default",
+      secret_key: "sk-default",
+    });
+  });
+
+  it("keeps project and environment overrides above the selected Codex home", async () => {
+    const codexHome = makeTmpHome({
+      rel: "langfuse.json",
+      contents: {
+        enabled: true,
+        public_key: "pk-selected",
+        secret_key: "sk-selected",
+        tags: ["selected"],
+      },
+    });
+    const cwd = makeTmpHome({
+      rel: ".codex/langfuse.json",
+      contents: { tags: ["project"], max_chars: 1234 },
+    });
+    const config = await getConfig({
+      home: emptyHome(),
+      cwd,
+      env: { CODEX_HOME: codexHome, LANGFUSE_CODEX_MAX_CHARS: "4321" },
+    });
+    expect(config).toMatchObject({
+      enabled: true,
+      public_key: "pk-selected",
+      secret_key: "sk-selected",
+      tags: ["project"],
+      max_chars: 4321,
+    });
+  });
+
   it("reads credentials and enable flag from environment variables", async () => {
     const config = await getConfig({
       home: emptyHome(),
